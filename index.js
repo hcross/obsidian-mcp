@@ -949,7 +949,7 @@ class ObsidianMCPServer {
         },
         {
           name: "export_note_pdf",
-          description: "Export a single note as a beautifully formatted PDF",
+          description: "[DISABLED — security risk H-01] Puppeteer-based PDF export is disabled. Use export_note_html instead and convert to PDF locally.",
           inputSchema: {
             type: "object",
             properties: {
@@ -967,7 +967,7 @@ class ObsidianMCPServer {
         },
         {
           name: "export_vault_pdf",
-          description: "Export entire vault as a single PDF with table of contents and navigation",
+          description: "[DISABLED — security risk H-01] Puppeteer-based PDF export is disabled. Use export_vault_markdown_bundle or export_vault_json instead.",
           inputSchema: {
             type: "object",
             properties: {
@@ -4777,213 +4777,31 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
   }
 
   async exportNotePdf(args) {
-    const { filename, output_path } = args;
-    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
-
-    try {
-      const content = await fs.readFile(filepath, "utf-8");
-      const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '');
-      const html = await marked(bodyContent);
-
-      const styledHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <style>
-        @page { margin: 2cm; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 800px;
-            margin: 0 auto;
-        }
-        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 0.3em; }
-        h2 { color: #34495e; border-bottom: 1px solid #bdc3c7; padding-bottom: 0.2em; margin-top: 1.5em; }
-        h3 { color: #7f8c8d; margin-top: 1.2em; }
-        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; }
-        pre { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; overflow-x: auto; }
-        pre code { background: none; color: #ecf0f1; }
-        a { color: #3498db; text-decoration: none; }
-        blockquote { border-left: 4px solid #3498db; padding-left: 1em; color: #7f8c8d; margin: 1em 0; }
-        table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-        th { background: #3498db; color: white; }
-        img { max-width: 100%; height: auto; }
-    </style>
-</head>
-<body>
-    <h1>${filename.replace('.md', '')}</h1>
-    ${html}
-</body>
-</html>`;
-
-      const browser = await puppeteer.launch({ headless: "new" });
-      const page = await browser.newPage();
-      await page.setContent(styledHtml);
-      
-      const outputFile = output_path || filepath.replace('.md', '.pdf');
-      await page.pdf({
-        path: outputFile,
-        format: 'A4',
-        printBackground: true,
-        margin: { top: '2cm', right: '2cm', bottom: '2cm', left: '2cm' },
-      });
-
-      await browser.close();
-
-      return {
-        content: [{
-          type: "text",
-          text: `Exported to PDF: ${outputFile}`,
-        }],
-      };
-    } catch (error) {
-      return {
-        content: [{
-          type: "text",
-          text: `Error exporting to PDF: ${error.message}`,
-        }],
-        isError: true,
-      };
-    }
+    // SECURITY: Disabled — H-01
+    // Puppeteer/Chromium launches without CSP or network restrictions, and injects
+    // unsanitized HTML from note content, enabling SSRF and data exfiltration via
+    // crafted notes. Use export_note_html and convert locally instead.
+    return {
+      content: [{
+        type: "text",
+        text: "export_note_pdf is disabled for security reasons. Puppeteer-based PDF export allows potential HTML injection and network exfiltration from note content. Use export_note_html instead and convert to PDF locally.",
+      }],
+      isError: true,
+    };
   }
 
   async exportVaultPdf(args) {
-    const { output_path, include_toc = true, organize_by = 'folder' } = args || {};
-    
-    try {
-      const files = await fs.readdir(OBSIDIAN_VAULT_PATH);
-      const mdFiles = files.filter((f) => f.endsWith(".md"));
-      
-      const notes = [];
-      for (const file of mdFiles) {
-        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
-        const content = await fs.readFile(filepath, "utf-8");
-        const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
-        
-        let title = file.replace('.md', '');
-        let tags = [];
-        let type = 'note';
-        
-        if (frontmatterMatch) {
-          const titleMatch = frontmatterMatch[1].match(/title:\s*(.+)/);
-          const tagsMatch = frontmatterMatch[1].match(/tags:\s*\[(.*?)\]/);
-          const typeMatch = frontmatterMatch[1].match(/type:\s*(.+)/);
-          
-          if (titleMatch) title = titleMatch[1];
-          if (tagsMatch) tags = tagsMatch[1].split(",").map((t) => t.trim().replace(/"/g, ""));
-          if (typeMatch) type = typeMatch[1].trim();
-        }
-        
-        const body = content.replace(/^---\n[\s\S]*?\n---\n/, '');
-        notes.push({ filename: file, title, tags, type, content: body });
-      }
-
-      let tocHtml = '';
-      let contentHtml = '';
-      let pageNum = 1;
-
-      if (include_toc) {
-        tocHtml = '<div style="page-break-after: always;"><h1>Table of Contents</h1><ul style="list-style: none; padding: 0;">';
-        notes.forEach((note, idx) => {
-          tocHtml += `<li style="margin: 0.5em 0;"><a href="#note-${idx}" style="color: #3498db;">${note.title}</a></li>`;
-        });
-        tocHtml += '</ul></div>';
-      }
-
-      for (let i = 0; i < notes.length; i++) {
-        const note = notes[i];
-        const html = await marked(note.content);
-        contentHtml += `
-<div style="page-break-before: always;" id="note-${i}">
-    <h1 style="color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 0.3em;">${note.title}</h1>
-    <p style="color: #7f8c8d; font-size: 0.9em;">Type: ${note.type} | Tags: ${note.tags.join(', ') || 'none'}</p>
-    ${html}
-</div>`;
-      }
-
-      const fullHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Vault Export - ${path.basename(OBSIDIAN_VAULT_PATH)}</title>
-    <style>
-        @page { 
-            margin: 2.5cm;
-            @top-right { content: counter(page); }
-        }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
-        }
-        h1 { color: #2c3e50; margin-top: 0; }
-        h2 { color: #34495e; border-bottom: 1px solid #bdc3c7; padding-bottom: 0.2em; margin-top: 1.5em; }
-        h3 { color: #7f8c8d; margin-top: 1.2em; }
-        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; font-size: 0.9em; }
-        pre { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; overflow-x: auto; margin: 1em 0; }
-        pre code { background: none; color: #ecf0f1; }
-        a { color: #3498db; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        blockquote { border-left: 4px solid #3498db; padding-left: 1em; color: #7f8c8d; margin: 1em 0; font-style: italic; }
-        table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-        th { background: #3498db; color: white; font-weight: 600; }
-        tr:nth-child(even) { background: #f9f9f9; }
-        img { max-width: 100%; height: auto; display: block; margin: 1em auto; }
-        ul, ol { margin: 0.5em 0; }
-        li { margin: 0.3em 0; }
-    </style>
-</head>
-<body>
-    <div style="text-align: center; padding: 4cm 0;">
-        <h1 style="font-size: 3em; margin-bottom: 0.2em;">📚 ${path.basename(OBSIDIAN_VAULT_PATH)}</h1>
-        <p style="font-size: 1.2em; color: #7f8c8d;">Complete Vault Export</p>
-        <p style="color: #95a5a6;">${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}</p>
-        <p style="color: #95a5a6;">${notes.length} notes</p>
-    </div>
-    ${tocHtml}
-    ${contentHtml}
-</body>
-</html>`;
-
-      const browser = await puppeteer.launch({ headless: "new" });
-      const page = await browser.newPage();
-      await page.setContent(fullHtml, { waitUntil: 'networkidle0' });
-      
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const outputFile = output_path || path.join(__dirname, `vault-export-${timestamp}.pdf`);
-      
-      await page.pdf({
-        path: outputFile,
-        format: 'A4',
-        printBackground: true,
-        displayHeaderFooter: true,
-        headerTemplate: '<div></div>',
-        footerTemplate: '<div style="font-size: 10px; text-align: center; width: 100%;"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
-        margin: { top: '2.5cm', right: '2.5cm', bottom: '2.5cm', left: '2.5cm' },
-      });
-
-      await browser.close();
-
-      return {
-        content: [{
-          type: "text",
-          text: `Exported ${notes.length} notes to PDF: ${outputFile}`,
-        }],
-      };
-    } catch (error) {
-      return {
-        content: [{
-          type: "text",
-          text: `Error exporting vault to PDF: ${error.message}`,
-        }],
-        isError: true,
-      };
-    }
+    // SECURITY: Disabled — H-01
+    // Puppeteer/Chromium launches without CSP or network restrictions and processes
+    // unsanitized HTML from all vault notes, amplifying SSRF and exfiltration risk
+    // across the entire vault. Use export_vault_markdown_bundle or export_vault_json instead.
+    return {
+      content: [{
+        type: "text",
+        text: "export_vault_pdf is disabled for security reasons. Use export_vault_markdown_bundle or export_vault_json instead.",
+      }],
+      isError: true,
+    };
   }
 
   async exportNoteMarkdown(args) {

@@ -22,6 +22,39 @@ consolidated in PR #1.
 | M-05 | MEDIUM | System paths in error messages |
 | M-08 | MEDIUM | No audit logging |
 
+
+## Remediated Vulnerabilities
+
+### H-01 — Puppeteer SSRF / HTML Injection (Fixed in `security/fix-3-puppeteer`)
+
+**Affected tools:** `export_note_pdf`, `export_vault_pdf`
+
+**Attack surface:** Both tools launched a Chromium instance via Puppeteer with
+no Content Security Policy, no network restrictions, and no sandbox arguments.
+Note content was converted to HTML via `marked` without sanitization and passed
+directly to `page.setContent()`. A crafted note could trigger outbound HTTP
+requests (SSRF) or exfiltrate vault content via `fetch`, `<img src>`, or
+`<link>` pointing to an attacker-controlled server.
+
+**Remediation:** Both tools are disabled. They now return `isError: true` with
+a message pointing users to safe alternatives:
+
+- `export_note_pdf` → use `export_note_html` and convert to PDF locally with
+  a sandboxed renderer (e.g., `wkhtmltopdf --disable-javascript`, Pandoc, or a
+  local browser print dialog).
+- `export_vault_pdf` → use `export_vault_markdown_bundle` or `export_vault_json`.
+
+**`puppeteer` dependency** has been moved from `dependencies` to
+`optionalDependencies` in `package.json`. It is not required for any active tool.
+A future sandboxed PDF implementation must:
+
+1. Launch Chromium with `--no-sandbox` blocked (run as non-root), `--disable-gpu`.
+2. Use `page.setRequestInterception(true)` to block all non-data URLs.
+3. Sanitize HTML through DOMPurify before passing to `page.setContent()`.
+4. Set a strict CSP via `page.setExtraHTTPHeaders`.
+
+Until that implementation lands, the tools remain disabled.
+
 ## Reporting
 
 To report a security issue, please open a GitHub issue with the `security` label.
