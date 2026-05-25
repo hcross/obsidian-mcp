@@ -7908,37 +7908,9 @@ Note: For full version history, use a git repository or Obsidian Sync.
     }
   }
 
-  async listTrash(args) {
-    const trashDir = path.join(OBSIDIAN_VAULT_PATH, '.trash');
-    try {
-      const files = await fs.readdir(trashDir);
-      const items = files.map(f => {
-        const parts = f.match(/^(\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}Z)_(.+)$/);
-        return parts
-          ? { trash_id: f, original_name: parts[2], deleted_at: parts[1].replace(/-/g, (m, o) => o > 18 ? ':' : m) }
-          : { trash_id: f, original_name: f };
-      });
-      return { content: [{ type: "text", text: JSON.stringify(items, null, 2) }] };
-    } catch {
-      return { content: [{ type: "text", text: "Trash is empty or does not exist." }] };
-    }
-  }
 
-  async restoreFromTrash(args) {
-    const { trash_id } = args;
-    const trashPath = path.join(OBSIDIAN_VAULT_PATH, '.trash', trash_id);
-    const parts = trash_id.match(/^\\d{4}-\\d{2}-\\d{2}T[\\d-]+Z_(.+)$/);
-    const originalName = parts ? parts[1] : trash_id;
-    const restorePath = path.join(OBSIDIAN_VAULT_PATH, originalName);
-    try {
-      await fs.rename(trashPath, restorePath);
-      return { content: [{ type: "text", text: `Restored "${originalName}" from trash.` }] };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: `Error restoring from trash: ${error.message}` }],
-        isError: true,
-      };
-    }
+
+
 
   async getAuditLog(args) {
     const { last_n = 50 } = args || {};
