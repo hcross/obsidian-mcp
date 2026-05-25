@@ -43,6 +43,31 @@ function safeVaultPath(base, userInput) {
   return resolved;
 }
 
+/**
+ * Moves a file to the vault's .trash directory instead of permanently deleting it.
+ * If OBSIDIAN_HARD_DELETE=true, performs permanent deletion instead.
+ *
+ * @param {string} filepath - Absolute path of the file to trash
+ * @returns {string|null} Trash path if moved, null if hard-deleted
+ */
+async function moveToTrash(filepath) {
+  if (process.env.OBSIDIAN_HARD_DELETE === 'true') {
+    await fs.unlink(filepath);
+    return null;
+  }
+
+  const trashDir = path.join(OBSIDIAN_VAULT_PATH, '.trash');
+  await fs.mkdir(trashDir, { recursive: true });
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const basename = path.basename(filepath);
+  const trashName = `${timestamp}_${basename}`;
+  const trashPath = path.join(trashDir, trashName);
+
+  await fs.rename(filepath, trashPath);
+  return trashPath;
+}
+
 class ObsidianMCPServer {
   constructor() {
     this.server = new Server(
@@ -2808,11 +2833,14 @@ Start saving code snippets, thread summaries, and knowledge notes!
     const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
-      await fs.unlink(filepath);
+      const trashPath = await moveToTrash(filepath);
+      const message = trashPath
+        ? `Successfully moved ${filename} to trash (${path.basename(trashPath)})`
+        : `Successfully deleted ${filename}`;
       return {
         content: [{
           type: "text",
-          text: `Successfully deleted ${filename}`,
+          text: message,
         }],
       };
     } catch (error) {
