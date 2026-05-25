@@ -150,22 +150,81 @@ async function moveToTrash(filepath) {
   return trashPath;
 }
 
-async function moveToTrash(filepath) {
-  if (process.env.OBSIDIAN_HARD_DELETE === 'true') {
-    await fs.unlink(filepath);
-    return null;
+/**
+ * Append-only NDJSON audit logger for sensitive vault operations (M-08).
+ *
+ * Privacy contract: only operation metadata is logged — note content,
+ * body, and any free-text fields are never written to disk.
+ * The log file lives inside the vault as <vault>/.mcp-audit.log.
+ */
+class AuditLogger {
+  constructor(vaultPath) {
+    this.logPath = path.join(vaultPath, '.mcp-audit.log');
+    this.maxEntries = parseInt(process.env.OBSIDIAN_AUDIT_MAX_ENTRIES) || 10000;
+    this.enabled = process.env.OBSIDIAN_AUDIT_LOG !== 'false';
   }
 
-  const trashDir = path.join(OBSIDIAN_VAULT_PATH, '.trash');
-  await fs.mkdir(trashDir, { recursive: true });
+  async log(operation, args, result) {
+    if (!this.enabled) return;
 
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const basename = path.basename(filepath);
-  const trashName = `${timestamp}_${basename}`;
-  const trashPath = path.join(trashDir, trashName);
+    // Log metadata only — never note content
+    const safeArgs = this._sanitizeArgs(args);
 
-  await fs.rename(filepath, trashPath);
-  return trashPath;
+    const entry = JSON.stringify({
+      ts: new Date().toISOString(),
+      op: operation,
+      args: safeArgs,
+      result: result === 'ok' ? 'ok' : 'error',
+      ...(result !== 'ok' ? { error: String(result).substring(0, 100) } : {}),
+    }) + '\n';
+
+    try {
+      await fs.appendFile(this.logPath, entry, 'utf-8');
+      await this._rotate();
+    } catch {
+      // Audit log must never block normal operations
+    }
+  }
+
+  _sanitizeArgs(args) {
+    if (!args) return {};
+    // Retain only non-content fields — never include "content", "body", "text", etc.
+    const safe = {};
+    const allowedKeys = [
+      'filename', 'folder_path', 'destination_folder',
+      'old_filename', 'new_filename', 'output_path',
+      'tags', 'delete_originals', 'dry_run',
+      'source_path', 'dest_name', 'last_n', 'trash_id',
+      'filenames', 'output_filename', 'pattern', 'replacement',
+    ];
+    for (const key of allowedKeys) {
+      if (args[key] !== undefined) safe[key] = args[key];
+    }
+    return safe;
+  }
+
+  async _rotate() {
+    try {
+      const content = await fs.readFile(this.logPath, 'utf-8');
+      const lines = content.trim().split('\n');
+      if (lines.length > this.maxEntries) {
+        const trimmed = lines.slice(-this.maxEntries).join('\n') + '\n';
+        await fs.writeFile(this.logPath, trimmed, 'utf-8');
+      }
+    } catch {
+      // Skip rotation if file is unreadable
+    }
+  }
+
+  async getLast(n = 50) {
+    try {
+      const content = await fs.readFile(this.logPath, 'utf-8');
+      const lines = content.trim().split('\n').filter(Boolean);
+      return lines.slice(-n).map(l => JSON.parse(l));
+    } catch {
+      return [];
+    }
+  }
 }
 
 class ObsidianMCPServer {
@@ -182,6 +241,7 @@ class ObsidianMCPServer {
       }
     );
 
+    this.audit = new AuditLogger(OBSIDIAN_VAULT_PATH);
     this.setupToolHandlers();
     this.server.onerror = (error) => console.error("[MCP Error]", error);
     process.on("SIGINT", async () => {
@@ -2231,6 +2291,16 @@ class ObsidianMCPServer {
               },
             },
             required: ["trash_id"],
+          name: "get_audit_log",
+          description: "Retrieve recent audit log entries for sensitive operations",
+          inputSchema: {
+            type: "object",
+            properties: {
+              last_n: {
+                type: "number",
+                description: "Number of recent entries to return (default: 50, max: 200)",
+              },
+            },
           },
         },
       ],
@@ -2494,6 +2564,8 @@ class ObsidianMCPServer {
           return await this.listTrash(request.params.arguments);
         case "restore_from_trash":
           return await this.restoreFromTrash(request.params.arguments);
+        case "get_audit_log":
+          return await this.getAuditLog(request.params.arguments);
         default:
           throw new Error(`Unknown tool: ${request.params.name}`);
       }
@@ -2798,6 +2870,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
 `;
 
       await fs.writeFile(path.join(vaultPath, "Welcome.md"), welcomeContent, "utf-8");
+      await this.audit.log('createVault', args, 'ok');
 
       return {
         content: [
@@ -2808,6 +2881,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
         ],
       };
     } catch (error) {
+      await this.audit.log('createVault', args, error.message);
       return {
         content: [
           {
@@ -2950,6 +3024,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
       }
 
       await fs.writeFile(filepath, finalContent, "utf-8");
+      await this.audit.log('updateNote', args, 'ok');
 
       return {
         content: [{
@@ -2958,6 +3033,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
         }],
       };
     } catch (error) {
+      await this.audit.log('updateNote', args, error.message);
       return {
         content: [{
           type: "text",
@@ -2977,6 +3053,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
       const message = trashPath
         ? `Successfully moved ${filename} to trash (${path.basename(trashPath)})`
         : `Successfully deleted ${filename}`;
+      await this.audit.log('deleteNote', args, 'ok');
       return {
         content: [{
           type: "text",
@@ -2984,6 +3061,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
         }],
       };
     } catch (error) {
+      await this.audit.log('deleteNote', args, error.message);
       return {
         content: [{
           type: "text",
@@ -3002,6 +3080,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
       const existingContent = await fs.readFile(filepath, "utf-8");
       const newContent = existingContent + "\n\n" + content;
       await fs.writeFile(filepath, newContent, "utf-8");
+      await this.audit.log('appendToNote', args, 'ok');
 
       return {
         content: [{
@@ -3010,6 +3089,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
         }],
       };
     } catch (error) {
+      await this.audit.log('appendToNote', args, error.message);
       return {
         content: [{
           type: "text",
@@ -3052,6 +3132,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
     try {
       await fs.mkdir(destFolder, { recursive: true });
       await fs.rename(sourcePath, destPath);
+      await this.audit.log('moveNote', args, 'ok');
       
       return {
         content: [{
@@ -3060,6 +3141,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
         }],
       };
     } catch (error) {
+      await this.audit.log('moveNote', args, error.message);
       return {
         content: [{
           type: "text",
@@ -3078,6 +3160,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
     try {
       await fs.rename(oldPath, newPath);
+      await this.audit.log('renameNote', args, 'ok');
       
       return {
         content: [{
@@ -3086,6 +3169,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
         }],
       };
     } catch (error) {
+      await this.audit.log('renameNote', args, error.message);
       return {
         content: [{
           type: "text",
@@ -4848,6 +4932,7 @@ ${noteLinks}
       const deleteLabel = delete_originals
         ? (process.env.OBSIDIAN_HARD_DELETE === 'true' ? ' (originals deleted)' : ' (originals moved to trash)')
         : '';
+      await this.audit.log('mergeNotes', args, 'ok');
       return {
         content: [{
           type: "text",
@@ -4855,6 +4940,7 @@ ${noteLinks}
         }],
       };
     } catch (error) {
+      await this.audit.log('mergeNotes', args, error.message);
       return {
         content: [{
           type: "text",
@@ -5036,6 +5122,7 @@ ${noteLinks}
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const outputFile = output_path || path.join(__dirname, `vault-export-${timestamp}.json`);
       await fs.writeFile(outputFile, JSON.stringify(vault, null, 2), "utf-8");
+      await this.audit.log('exportVaultJson', args, 'ok');
 
       return {
         content: [{
@@ -5044,6 +5131,7 @@ ${noteLinks}
         }],
       };
     } catch (error) {
+      await this.audit.log('exportVaultJson', args, error.message);
       return {
         content: [{
           type: "text",
@@ -5096,6 +5184,7 @@ ${noteLinks}
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const outputFile = output_path || path.join(__dirname, `vault-index-${timestamp}.csv`);
       await fs.writeFile(outputFile, csv, "utf-8");
+      await this.audit.log('exportVaultCsv', args, 'ok');
 
       return {
         content: [{
@@ -5104,6 +5193,7 @@ ${noteLinks}
         }],
       };
     } catch (error) {
+      await this.audit.log('exportVaultCsv', args, error.message);
       return {
         content: [{
           type: "text",
@@ -5183,6 +5273,7 @@ ${noteLinks}
 
       const files = await fs.readdir(exportDir);
       const mdCount = files.filter(f => f.endsWith('.md')).length;
+      await this.audit.log('exportVaultMarkdownBundle', args, 'ok');
 
       return {
         content: [{
@@ -5191,6 +5282,7 @@ ${noteLinks}
         }],
       };
     } catch (error) {
+      await this.audit.log('exportVaultMarkdownBundle', args, error.message);
       return {
         content: [{
           type: "text",
@@ -6005,6 +6097,7 @@ ${noteLinks}
       const destPath = path.join(attachDir, filename);
 
       await fs.copyFile(resolvedSource, destPath);
+      await this.audit.log('attachFile', args, 'ok');
 
       return {
         content: [{
@@ -6013,6 +6106,7 @@ ${noteLinks}
         }],
       };
     } catch (error) {
+      await this.audit.log('attachFile', args, error.message);
       return {
         content: [{
           type: "text",
@@ -6193,6 +6287,7 @@ ${noteLinks}
         }
       }
 
+      await this.audit.log('regexSearchAndReplace', args, 'ok');
       return {
         content: [{
           type: "text",
@@ -6200,6 +6295,7 @@ ${noteLinks}
         }],
       };
     } catch (error) {
+      await this.audit.log('regexSearchAndReplace', args, error.message);
       return {
         content: [{
           type: "text",
@@ -7846,6 +7942,18 @@ Note: For full version history, use a git repository or Obsidian Sync.
         isError: true,
       };
     }
+
+  async getAuditLog(args) {
+    const { last_n = 50 } = args || {};
+    const entries = await this.audit.getLast(Math.min(last_n, 200));
+    return {
+      content: [{
+        type: "text",
+        text: entries.length > 0
+          ? entries.map(e => JSON.stringify(e)).join('\n')
+          : "Audit log is empty or disabled.",
+      }],
+    };
   }
 
   async run() {
