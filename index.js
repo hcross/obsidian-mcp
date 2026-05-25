@@ -125,6 +125,18 @@ function safeVaultPath(base, userInput) {
   return resolved;
 }
 
+async function safeOutputPath(userOutputPath, defaultFilename) {
+  const exportsDir = process.env.OBSIDIAN_EXPORTS_DIR ? path.resolve(process.env.OBSIDIAN_EXPORTS_DIR) : path.resolve(OBSIDIAN_VAULT_PATH, '.exports');
+  await fs.mkdir(exportsDir, { recursive: true });
+  if (!userOutputPath) return path.join(exportsDir, defaultFilename);
+  const resolved = path.resolve(userOutputPath);
+  const vaultBase = path.resolve(OBSIDIAN_VAULT_PATH);
+  if (!resolved.startsWith(vaultBase + path.sep) && !resolved.startsWith(exportsDir + path.sep) && resolved !== vaultBase) {
+    throw new Error(`Export path "${userOutputPath}" must be within vault or OBSIDIAN_EXPORTS_DIR. Set OBSIDIAN_EXPORTS_DIR env var to allow a custom export directory.`);
+  }
+  return resolved;
+}
+
 /**
  * Moves a file to the vault's .trash directory instead of permanently deleting it.
  * If OBSIDIAN_HARD_DELETE=true, performs permanent deletion instead.
@@ -3573,7 +3585,7 @@ ${sanitizeHtml(bodyContent)}
 </body>
 </html>`;
 
-      const outputFile = output_path || filepath.replace('.md', '.html');
+      const outputFile = await safeOutputPath(output_path, 'note-export.html');
       await fs.writeFile(outputFile, html, "utf-8");
 
       return {
@@ -4858,7 +4870,7 @@ ${noteLinks}
     const { output_path } = args || {};
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const archiveName = `vault-export-${timestamp}.tar`;
-    const archivePath = output_path || path.join(__dirname, archiveName);
+    const archivePath = await safeOutputPath(output_path, archiveName);
 
     try {
       return {
@@ -5056,7 +5068,7 @@ ${noteLinks}
         }
       }
 
-      const outputFile = output_path || filepath.replace('.md', '-export.md');
+      const outputFile = await safeOutputPath(output_path, 'note-export.md');
       await fs.writeFile(outputFile, content, "utf-8");
 
       return {
@@ -5120,7 +5132,7 @@ ${noteLinks}
       }
 
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const outputFile = output_path || path.join(__dirname, `vault-export-${timestamp}.json`);
+      const outputFile = await safeOutputPath(output_path, `vault-export-${Date.now()}.json`);
       await fs.writeFile(outputFile, JSON.stringify(vault, null, 2), "utf-8");
       await this.audit.log('exportVaultJson', args, 'ok');
 
@@ -5182,7 +5194,7 @@ ${noteLinks}
 
       const csv = parse(rows);
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const outputFile = output_path || path.join(__dirname, `vault-index-${timestamp}.csv`);
+      const outputFile = await safeOutputPath(output_path, `vault-index-${Date.now()}.csv`);
       await fs.writeFile(outputFile, csv, "utf-8");
       await this.audit.log('exportVaultCsv', args, 'ok');
 
@@ -5222,7 +5234,7 @@ ${noteLinks}
         .replace(/^[-*]\s+/gm, '• ')
         .trim();
 
-      const outputFile = output_path || filepath.replace('.md', '.txt');
+      const outputFile = await safeOutputPath(output_path, 'note-export.txt');
       await fs.writeFile(outputFile, plaintext, "utf-8");
 
       return {
@@ -5247,7 +5259,7 @@ ${noteLinks}
 
     try {
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const exportDir = output_path || path.join(__dirname, `vault-bundle-${timestamp}`);
+      const exportDir = await safeOutputPath(output_path, `vault-bundle-${Date.now()}.zip`);
       
       await fs.mkdir(exportDir, { recursive: true });
 
