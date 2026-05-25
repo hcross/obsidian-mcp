@@ -13,6 +13,21 @@ import dotenv from "dotenv";
 import { marked } from "marked";
 import puppeteer from "puppeteer";
 import { parse } from "json2csv";
+import yaml from "js-yaml";
+
+/**
+ * Safely builds a YAML frontmatter block using js-yaml serialization.
+ * Prevents YAML injection by properly escaping all field values.
+ * Undefined/null fields are omitted to avoid polluting the frontmatter.
+ * @param {Object} fields - Key/value pairs to include in the frontmatter
+ * @returns {string} - A complete frontmatter block including --- delimiters
+ */
+function buildFrontmatter(fields) {
+  const clean = Object.fromEntries(
+    Object.entries(fields).filter(([, v]) => v !== undefined && v !== null)
+  );
+  return `---\n${yaml.dump(clean, { lineWidth: -1 })}---\n`;
+}
 
 // Load .env file from the same directory as this script
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -2373,14 +2388,13 @@ class ObsidianMCPServer {
 
     const relatedNotes = await this.findRelatedNotes(tags, language);
 
-    const content = `---
-title: ${title}
-type: code-snippet
-language: ${language}
-created: ${timestamp}
-tags: [${tags.map((t) => `"${t}"`).join(", ")}]
----
-
+    const content = buildFrontmatter({
+      title,
+      type: "code-snippet",
+      language,
+      created: timestamp,
+      tags,
+    }) + `
 # ${title}
 
 ${description ? `## Description\n\n${description}\n\n` : ""}## Code
@@ -2418,13 +2432,12 @@ ${relatedNotes.length > 0 ? `## Related Notes\n\n${relatedNotes.map(note => `- [
     const languages = [...new Set(code_snippets.map(s => s.language).filter(Boolean))];
     const relatedNotes = await this.findRelatedNotes(tags, languages.join(','));
 
-    let content = `---
-title: ${title}
-type: thread-summary
-created: ${timestamp}
-tags: [${tags.map((t) => `"${t}"`).join(", ")}]
----
-
+    let content = buildFrontmatter({
+      title,
+      type: "thread-summary",
+      created: timestamp,
+      tags,
+    }) + `
 # ${title}
 
 ## Summary
@@ -2475,13 +2488,12 @@ ${relatedNotes.length > 0 ? `## Related Notes\n\n${relatedNotes.map(note => `- [
 
     const relatedNotes = await this.findRelatedNotes(tags, null);
 
-    const noteContent = `---
-title: ${title}
-type: knowledge-note
-created: ${timestamp}
-tags: [${tags.map((t) => `"${t}"`).join(", ")}]
----
-
+    const noteContent = buildFrontmatter({
+      title,
+      type: "knowledge-note",
+      created: timestamp,
+      tags,
+    }) + `
 # ${title}
 
 ${content}
@@ -2974,25 +2986,12 @@ Start saving code snippets, thread summaries, and knowledge notes!
         };
       }
 
-      const frontmatter = frontmatterMatch[1];
-      const tagsMatch = frontmatter.match(/tags:\s*\[(.*?)\]/);
-      
-      let existingTags = [];
-      if (tagsMatch) {
-        existingTags = tagsMatch[1].split(",").map((t) => t.trim().replace(/"/g, ""));
-      }
-
-      const newTags = [...new Set([...existingTags, ...tags])];
-      const tagsString = newTags.map((t) => `"${t}"`).join(", ");
-      
-      let newFrontmatter;
-      if (tagsMatch) {
-        newFrontmatter = frontmatter.replace(/tags:\s*\[.*?\]/, `tags: [${tagsString}]`);
-      } else {
-        newFrontmatter = frontmatter + `\ntags: [${tagsString}]`;
-      }
-
-      const newContent = content.replace(/^---\n[\s\S]*?\n---/, `---\n${newFrontmatter}\n---`);
+      // Parse existing frontmatter, merge tags, and re-serialize safely
+      const parsed = yaml.load(frontmatterMatch[1]) || {};
+      const existingTags = Array.isArray(parsed.tags) ? parsed.tags : (parsed.tags ? [parsed.tags] : []);
+      parsed.tags = [...new Set([...existingTags, ...tags])];
+      const serialized = `---\n${yaml.dump(parsed, { lineWidth: -1 })}---`;
+      const newContent = content.replace(frontmatterMatch[0], serialized);
       await fs.writeFile(filepath, newContent, "utf-8");
 
       return {
@@ -3042,12 +3041,10 @@ Start saving code snippets, thread summaries, and knowledge notes!
         };
       }
 
-      const existingTags = tagsMatch[1].split(",").map((t) => t.trim().replace(/"/g, ""));
       const remainingTags = existingTags.filter(t => !tags.includes(t));
-      const tagsString = remainingTags.map((t) => `"${t}"`).join(", ");
-      
-      const newFrontmatter = frontmatter.replace(/tags:\s*\[.*?\]/, `tags: [${tagsString}]`);
-      const newContent = content.replace(/^---\n[\s\S]*?\n---/, `---\n${newFrontmatter}\n---`);
+      parsed.tags = remainingTags;
+      const serialized = `---\n${yaml.dump(parsed, { lineWidth: -1 })}---`;
+      const newContent = content.replace(frontmatterMatch[0], serialized);
       await fs.writeFile(filepath, newContent, "utf-8");
 
       return {
@@ -3173,13 +3170,12 @@ Start saving code snippets, thread summaries, and knowledge notes!
         };
       }
 
-      const content = template_content || `---
-title: Daily Note ${dateStr}
-type: daily-note
-created: ${today.toISOString()}
-tags: ["daily"]
----
-
+      const content = template_content || buildFrontmatter({
+        title: `Daily Note ${dateStr}`,
+        type: "daily-note",
+        created: today.toISOString(),
+        tags: ["daily"],
+      }) + `
 # ${dateStr}
 
 ## Tasks
@@ -3849,13 +3845,12 @@ ${bodyContent}
 
     const taskList = tasks.map(task => `- [ ] ${task}`).join('\n');
     
-    const content = `---
-title: ${title}
-type: task-list
-created: ${timestamp}
-tags: ["tasks"]
----
-
+    const content = buildFrontmatter({
+      title,
+      type: "task-list",
+      created: timestamp,
+      tags: ["tasks"],
+    }) + `
 # ${title}
 
 ${taskList}
@@ -4124,13 +4119,12 @@ ${taskList}
 
       const noteLinks = relatedNotes.map(note => `- [[${note.filename.replace('.md', '')}|${note.title}]]`).join('\n');
       
-      const content = `---
-title: ${title}
-type: moc
-created: ${new Date().toISOString()}
-tags: ["${tag}", "moc"]
----
-
+      const content = buildFrontmatter({
+        title,
+        type: "moc",
+        created: new Date().toISOString(),
+        tags: [tag, "moc"],
+      }) + `
 # ${title}
 
 > A Map of Content for notes tagged with #${tag}
@@ -4625,6 +4619,7 @@ ${noteLinks}
         }],
       };
     } catch (error) {
+      await this.audit.log('importMarkdownFolder', args, error.message);
       return {
         content: [{
           type: "text",
@@ -4677,14 +4672,13 @@ ${noteLinks}
     const outputPath = safeVaultPath(OBSIDIAN_VAULT_PATH, output_filename.endsWith('.md') ? output_filename : `${output_filename}.md`);
 
     try {
-      let mergedContent = `---
-title: ${output_filename.replace('.md', '')}
-type: merged-note
-created: ${new Date().toISOString()}
-tags: ["merged"]
-merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
----
-
+      let mergedContent = buildFrontmatter({
+        title: output_filename.replace('.md', ''),
+        type: "merged-note",
+        created: new Date().toISOString(),
+        tags: ["merged"],
+        merged_from: filenames,
+      }) + `
 # ${output_filename.replace('.md', '')}
 
 `;
@@ -4802,6 +4796,213 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       }],
       isError: true,
     };
+    const { filename, output_path } = args;
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
+
+    try {
+      const content = await fs.readFile(filepath, "utf-8");
+      const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '');
+      const html = await marked(bodyContent);
+
+      const styledHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        @page { margin: 2cm; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 0.3em; }
+        h2 { color: #34495e; border-bottom: 1px solid #bdc3c7; padding-bottom: 0.2em; margin-top: 1.5em; }
+        h3 { color: #7f8c8d; margin-top: 1.2em; }
+        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; }
+        pre { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; overflow-x: auto; }
+        pre code { background: none; color: #ecf0f1; }
+        a { color: #3498db; text-decoration: none; }
+        blockquote { border-left: 4px solid #3498db; padding-left: 1em; color: #7f8c8d; margin: 1em 0; }
+        table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+        th { background: #3498db; color: white; }
+        img { max-width: 100%; height: auto; }
+    </style>
+</head>
+<body>
+    <h1>${filename.replace('.md', '')}</h1>
+    ${html}
+</body>
+</html>`;
+
+      const browser = await puppeteer.launch({ headless: "new" });
+      const page = await browser.newPage();
+      await page.setContent(styledHtml);
+      
+      const outputFile = output_path || filepath.replace('.md', '.pdf');
+      await page.pdf({
+        path: outputFile,
+        format: 'A4',
+        printBackground: true,
+        margin: { top: '2cm', right: '2cm', bottom: '2cm', left: '2cm' },
+      });
+
+      await browser.close();
+
+      return {
+        content: [{
+          type: "text",
+          text: `Exported to PDF: ${outputFile}`,
+        }],
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error exporting to PDF: ${error.message}`,
+        }],
+        isError: true,
+      };
+    }
+  }
+
+  async exportVaultPdf(args) {
+    const { output_path, include_toc = true, organize_by = 'folder' } = args || {};
+    
+    try {
+      const files = await fs.readdir(OBSIDIAN_VAULT_PATH);
+      const mdFiles = files.filter((f) => f.endsWith(".md"));
+      
+      const notes = [];
+      for (const file of mdFiles) {
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
+        const content = await fs.readFile(filepath, "utf-8");
+        const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+        
+        let title = file.replace('.md', '');
+        let tags = [];
+        let type = 'note';
+        
+        if (frontmatterMatch) {
+          const titleMatch = frontmatterMatch[1].match(/title:\s*(.+)/);
+          const tagsMatch = frontmatterMatch[1].match(/tags:\s*\[(.*?)\]/);
+          const typeMatch = frontmatterMatch[1].match(/type:\s*(.+)/);
+          
+          if (titleMatch) title = titleMatch[1];
+          if (tagsMatch) tags = tagsMatch[1].split(",").map((t) => t.trim().replace(/"/g, ""));
+          if (typeMatch) type = typeMatch[1].trim();
+        }
+        
+        const body = content.replace(/^---\n[\s\S]*?\n---\n/, '');
+        notes.push({ filename: file, title, tags, type, content: body });
+      }
+
+      let tocHtml = '';
+      let contentHtml = '';
+      let pageNum = 1;
+
+      if (include_toc) {
+        tocHtml = '<div style="page-break-after: always;"><h1>Table of Contents</h1><ul style="list-style: none; padding: 0;">';
+        notes.forEach((note, idx) => {
+          tocHtml += `<li style="margin: 0.5em 0;"><a href="#note-${idx}" style="color: #3498db;">${note.title}</a></li>`;
+        });
+        tocHtml += '</ul></div>';
+      }
+
+      for (let i = 0; i < notes.length; i++) {
+        const note = notes[i];
+        const html = await marked(note.content);
+        contentHtml += `
+<div style="page-break-before: always;" id="note-${i}">
+    <h1 style="color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 0.3em;">${note.title}</h1>
+    <p style="color: #7f8c8d; font-size: 0.9em;">Type: ${note.type} | Tags: ${note.tags.join(', ') || 'none'}</p>
+    ${html}
+</div>`;
+      }
+
+      const fullHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Vault Export - ${path.basename(OBSIDIAN_VAULT_PATH)}</title>
+    <style>
+        @page { 
+            margin: 2.5cm;
+            @top-right { content: counter(page); }
+        }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+        }
+        h1 { color: #2c3e50; margin-top: 0; }
+        h2 { color: #34495e; border-bottom: 1px solid #bdc3c7; padding-bottom: 0.2em; margin-top: 1.5em; }
+        h3 { color: #7f8c8d; margin-top: 1.2em; }
+        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; font-size: 0.9em; }
+        pre { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; overflow-x: auto; margin: 1em 0; }
+        pre code { background: none; color: #ecf0f1; }
+        a { color: #3498db; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        blockquote { border-left: 4px solid #3498db; padding-left: 1em; color: #7f8c8d; margin: 1em 0; font-style: italic; }
+        table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+        th { background: #3498db; color: white; font-weight: 600; }
+        tr:nth-child(even) { background: #f9f9f9; }
+        img { max-width: 100%; height: auto; display: block; margin: 1em auto; }
+        ul, ol { margin: 0.5em 0; }
+        li { margin: 0.3em 0; }
+    </style>
+</head>
+<body>
+    <div style="text-align: center; padding: 4cm 0;">
+        <h1 style="font-size: 3em; margin-bottom: 0.2em;">📚 ${path.basename(OBSIDIAN_VAULT_PATH)}</h1>
+        <p style="font-size: 1.2em; color: #7f8c8d;">Complete Vault Export</p>
+        <p style="color: #95a5a6;">${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}</p>
+        <p style="color: #95a5a6;">${notes.length} notes</p>
+    </div>
+    ${tocHtml}
+    ${contentHtml}
+</body>
+</html>`;
+
+      const browser = await puppeteer.launch({ headless: "new" });
+      const page = await browser.newPage();
+      await page.setContent(fullHtml, { waitUntil: 'networkidle0' });
+      
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const outputFile = output_path || path.join(__dirname, `vault-export-${timestamp}.pdf`);
+      
+      await page.pdf({
+        path: outputFile,
+        format: 'A4',
+        printBackground: true,
+        displayHeaderFooter: true,
+        headerTemplate: '<div></div>',
+        footerTemplate: '<div style="font-size: 10px; text-align: center; width: 100%;"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
+        margin: { top: '2.5cm', right: '2.5cm', bottom: '2.5cm', left: '2.5cm' },
+      });
+
+      await browser.close();
+
+      return {
+        content: [{
+          type: "text",
+          text: `Exported ${notes.length} notes to PDF: ${outputFile}`,
+        }],
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error exporting vault to PDF: ${error.message}`,
+        }],
+        isError: true,
+      };
+    }
   }
 
   async exportNoteMarkdown(args) {
@@ -6153,22 +6354,15 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
 
       if (!fmMatch) {
-        // Add frontmatter if it doesn't exist
-        const newFm = `---\n${field}: ${JSON.stringify(value)}\n---\n\n`;
+        // Add frontmatter if it doesn't exist — use js-yaml to serialize safely
+        const newFm = buildFrontmatter({ [field]: value }) + "\n";
         content = newFm + content;
       } else {
-        const fm = fmMatch[1];
-        const fieldRegex = new RegExp(`^${field}:.*$`, 'm');
-        
-        if (fieldRegex.test(fm)) {
-          // Update existing field
-          const newFm = fm.replace(fieldRegex, `${field}: ${JSON.stringify(value)}`);
-          content = content.replace(fmMatch[0], `---\n${newFm}\n---`);
-        } else {
-          // Add new field
-          const newFm = `${fm}\n${field}: ${JSON.stringify(value)}`;
-          content = content.replace(fmMatch[0], `---\n${newFm}\n---`);
-        }
+        // Parse the existing frontmatter, update the field, and re-serialize
+        const parsedFm = yaml.load(fmMatch[1]) || {};
+        parsedFm[field] = value;
+        const serialized = `---\n${yaml.dump(parsedFm, { lineWidth: -1 })}---`;
+        content = content.replace(fmMatch[0], serialized);
       }
 
       await fs.writeFile(filepath, content, 'utf-8');
@@ -6327,11 +6521,12 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
         const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
         if (fmMatch) {
-          const oldFm = fmMatch[1];
-          const newFm = oldFm.replace(new RegExp(`^${old_name}:`, 'm'), `${new_name}:`);
-          
-          if (oldFm !== newFm) {
-            content = content.replace(fmMatch[0], `---\n${newFm}\n---`);
+          const parsedFm = yaml.load(fmMatch[1]) || {};
+          if (Object.prototype.hasOwnProperty.call(parsedFm, old_name)) {
+            parsedFm[new_name] = parsedFm[old_name];
+            delete parsedFm[old_name];
+            const serialized = `---\n${yaml.dump(parsedFm, { lineWidth: -1 })}---`;
+            content = content.replace(fmMatch[0], serialized);
             await fs.writeFile(filepath, content, 'utf-8');
             updated++;
           }
@@ -6438,17 +6633,15 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
     const { title, author, genre = '' } = args;
     const filename = this.sanitizeFilename(`book-${title}`);
 
-    const content = `---
-title: ${title}
-type: book-note
-author: ${author}
-genre: ${genre}
-status: reading
-rating: 
-created: ${new Date().toISOString()}
-tags: ["books", "literature"]
----
-
+    const content = buildFrontmatter({
+      title,
+      type: "book-note",
+      author,
+      genre: genre || undefined,
+      status: "reading",
+      created: new Date().toISOString(),
+      tags: ["books", "literature"],
+    }) + `
 # ${title}
 
 **Author:** ${author}
@@ -6494,14 +6687,13 @@ tags: ["books", "literature"]
     const { name, relation = '' } = args;
     const filename = this.sanitizeFilename(`person-${name}`);
 
-    const content = `---
-title: ${name}
-type: person-note
-relation: ${relation}
-created: ${new Date().toISOString()}
-tags: ["people", "contacts"]
----
-
+    const content = buildFrontmatter({
+      title: name,
+      type: "person-note",
+      relation: relation || undefined,
+      created: new Date().toISOString(),
+      tags: ["people", "contacts"],
+    }) + `
 # ${name}
 
 **Relation:** ${relation}
@@ -6546,15 +6738,14 @@ tags: ["people", "contacts"]
     const { title, date = new Date().toISOString().split('T')[0], attendees = [] } = args;
     const filename = this.sanitizeFilename(`meeting-${date}-${title}`);
 
-    const content = `---
-title: ${title}
-type: meeting-note
-date: ${date}
-attendees: [${attendees.map(a => `"${a}"`).join(', ')}]
-created: ${new Date().toISOString()}
-tags: ["meetings"]
----
-
+    const content = buildFrontmatter({
+      title,
+      type: "meeting-note",
+      date,
+      attendees,
+      created: new Date().toISOString(),
+      tags: ["meetings"],
+    }) + `
 # ${title}
 
 **Date:** ${date}
@@ -6602,15 +6793,15 @@ tags: ["meetings"]
     const { name, goal = '', deadline = '' } = args;
     const filename = this.sanitizeFilename(`project-${name}`);
 
-    const content = `---
-title: ${name}
-type: project-note
-goal: ${goal}
-deadline: ${deadline}
-status: planning
-created: ${new Date().toISOString()}
-tags: ["projects"]
----
+    const content = buildFrontmatter({
+      title: name,
+      type: "project-note",
+      goal: goal || undefined,
+      deadline: deadline || undefined,
+      status: "planning",
+      created: new Date().toISOString(),
+      tags: ["projects"],
+    }) +
 
 # ${name}
 
@@ -6828,12 +7019,12 @@ tags: ["projects"]
         });
       }
 
-      const reportContent = `---
-title: Task Report
-type: task-report
-created: ${new Date().toISOString()}
-tags: ["tasks", "reports"]
----
+      const reportContent = buildFrontmatter({
+        title: "Task Report",
+        type: "task-report",
+        created: new Date().toISOString(),
+        tags: ["tasks", "reports"],
+      }) +
 
 # Task Report
 
@@ -7517,19 +7708,20 @@ Note: For full version history, use a git repository or Obsidian Sync.
         mergedContent = allContent.map(c => c.content).join('\n\n');
       }
 
-      const frontmatter = `---
-title: ${output_filename.replace('.md', '')}
-type: merged-note
-merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
-created: ${new Date().toISOString()}
-tags: ["merged"]
----
+      const frontmatter = buildFrontmatter({
+        title: output_filename.replace('.md', ''),
+        type: "merged-note",
+        merged_from: filenames,
+        created: new Date().toISOString(),
+        tags: ["merged"],
+      }).trimEnd()
 
 `;
 
       const outputPath = safeVaultPath(OBSIDIAN_VAULT_PATH, output_filename.endsWith('.md') ? output_filename : `${output_filename}.md`);
       await fs.writeFile(outputPath, frontmatter + mergedContent, 'utf-8');
 
+      await this.audit.log('mergeNotesEnhanced', args, 'ok');
       return {
         content: [{
           type: "text",
@@ -7537,6 +7729,7 @@ tags: ["merged"]
         }],
       };
     } catch (error) {
+      await this.audit.log('mergeNotesEnhanced', args, error.message);
       return {
         content: [{
           type: "text",

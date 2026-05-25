@@ -38,6 +38,28 @@ function assert(label, fn) {
   } catch (err) {
     console.error(`  FAIL  ${label}`);
     console.error(`        ${err.message}`);
+ * Security tests for YAML frontmatter injection prevention (Issue #8 — M-01)
+ */
+
+import yaml from "js-yaml";
+
+// Inline buildFrontmatter for isolated testing (mirrors the implementation in index.js)
+function buildFrontmatter(fields) {
+  const clean = Object.fromEntries(
+    Object.entries(fields).filter(([, v]) => v !== undefined && v !== null)
+  );
+  return `---\n${yaml.dump(clean, { lineWidth: -1 })}---\n`;
+}
+
+let passed = 0;
+let failed = 0;
+
+function assert(condition, message) {
+  if (condition) {
+    console.log(`  PASS: ${message}`);
+    passed++;
+  } else {
+    console.error(`  FAIL: ${message}`);
     failed++;
   }
 }
@@ -214,4 +236,104 @@ if (failed > 0) {
   process.exit(1);
 } else {
   console.log('All security tests passed.\n');
+// ---- Test 1: YAML injection via title ----
+console.log("\nTest 1: YAML injection via title field");
+{
+  const injected = buildFrontmatter({
+    title: "Test\n---\nmalicious: injected",
+    author: "Attacker",
+  });
+  const fmBody = injected.replace(/^---\n/, "").replace(/\n---\n$/, "");
+  const parsed = yaml.load(fmBody);
+  assert(!parsed.malicious, "YAML injection should be prevented (no 'malicious' key)");
+  assert(
+    parsed.title === "Test\n---\nmalicious: injected",
+    "Title should be preserved as-is (escaped by js-yaml)"
+  );
+}
+
+// ---- Test 2: Injection via author ----
+console.log("\nTest 2: YAML injection via author field");
+{
+  const injected = buildFrontmatter({
+    title: "Legit Title",
+    author: 'Attacker\ntags: ["pwned"]',
+  });
+  const fmBody = injected.replace(/^---\n/, "").replace(/\n---\n$/, "");
+  const parsed = yaml.load(fmBody);
+  assert(
+    !Array.isArray(parsed.tags) || !parsed.tags.includes("pwned"),
+    "Tag injection via author field should be prevented"
+  );
+  assert(
+    parsed.author === 'Attacker\ntags: ["pwned"]',
+    "Author field preserved verbatim"
+  );
+}
+
+// ---- Test 3: Special YAML characters in values ----
+console.log("\nTest 3: Special YAML characters handling");
+{
+  const fm = buildFrontmatter({
+    title: "Note: this has a colon",
+    description: "Value with 'quotes' and \"double quotes\"",
+    tag: "#special",
+  });
+  const fmBody = fm.replace(/^---\n/, "").replace(/\n---\n$/, "");
+  const parsed = yaml.load(fmBody);
+  assert(parsed.title === "Note: this has a colon", "Colon in value preserved");
+  assert(
+    parsed.description === "Value with 'quotes' and \"double quotes\"",
+    "Quotes in value preserved"
+  );
+  assert(parsed.tag === "#special", "Hash character preserved");
+}
+
+// ---- Test 4: Null/undefined fields are omitted ----
+console.log("\nTest 4: Null/undefined field filtering");
+{
+  const fm = buildFrontmatter({
+    title: "Test",
+    rating: null,
+    genre: undefined,
+    status: "reading",
+  });
+  const fmBody = fm.replace(/^---\n/, "").replace(/\n---\n$/, "");
+  const parsed = yaml.load(fmBody);
+  assert(parsed.title === "Test", "Title present");
+  assert(parsed.status === "reading", "Status present");
+  assert(!("rating" in parsed), "Null field omitted");
+  assert(!("genre" in parsed), "Undefined field omitted");
+}
+
+// ---- Test 5: Array tags serialized correctly ----
+console.log("\nTest 5: Array tags round-trip");
+{
+  const tags = ["security", "books", "tag-with-dash"];
+  const fm = buildFrontmatter({ title: "Test", tags });
+  const fmBody = fm.replace(/^---\n/, "").replace(/\n---\n$/, "");
+  const parsed = yaml.load(fmBody);
+  assert(Array.isArray(parsed.tags), "Tags is an array");
+  assert(
+    JSON.stringify(parsed.tags) === JSON.stringify(tags),
+    "Tags preserved exactly"
+  );
+}
+
+// ---- Test 6: Frontmatter delimiters intact ----
+console.log("\nTest 6: Frontmatter delimiters");
+{
+  const fm = buildFrontmatter({ title: "Test" });
+  assert(fm.startsWith("---\n"), "Starts with --- delimiter");
+  assert(fm.endsWith("---\n"), "Ends with --- delimiter");
+}
+
+// ---- Summary ----
+console.log(`\n${"=".repeat(40)}`);
+console.log(`Results: ${passed} passed, ${failed} failed`);
+if (failed > 0) {
+  console.error("YAML injection tests FAILED");
+  process.exit(1);
+} else {
+  console.log("All YAML injection tests passed");
 }
