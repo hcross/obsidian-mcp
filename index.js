@@ -31,6 +31,7 @@ function buildFrontmatter(fields) {
   return `---\n${yaml.dump(clean, { lineWidth: -1 })}---\n`;
 }
 
+// Allowlist-based HTML sanitization — blocks XSS while preserving rich Markdown output
 const SAFE_HTML_CONFIG = {
   ALLOWED_TAGS: [
     'p', 'br', 'hr',
@@ -79,6 +80,10 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 const VAULTS_BASE_PATH = process.env.VAULTS_BASE_PATH || process.cwd();
 let OBSIDIAN_VAULT_PATH = process.env.OBSIDIAN_VAULT_PATH || path.join(VAULTS_BASE_PATH, "CodeSnippets");
 
+// Guardrail limits for bulk destructive operations (H-05, H-06)
+const BATCH_LIMIT = parseInt(process.env.OBSIDIAN_BATCH_LIMIT) || 50;
+const REPLACE_LIMIT = parseInt(process.env.OBSIDIAN_REPLACE_LIMIT) || 100;
+
 /**
  * Resolves a user-supplied path relative to the vault base and ensures it
  * stays within the vault boundary (no path traversal).
@@ -105,6 +110,24 @@ function safeVaultPath(base, userInput) {
  * @param {string} filepath - Absolute path of the file to trash
  * @returns {string|null} Trash path if moved, null if hard-deleted
  */
+async function moveToTrash(filepath) {
+  if (process.env.OBSIDIAN_HARD_DELETE === 'true') {
+    await fs.unlink(filepath);
+    return null;
+  }
+
+  const trashDir = path.join(OBSIDIAN_VAULT_PATH, '.trash');
+  await fs.mkdir(trashDir, { recursive: true });
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const basename = path.basename(filepath);
+  const trashName = `${timestamp}_${basename}`;
+  const trashPath = path.join(trashDir, trashName);
+
+  await fs.rename(filepath, trashPath);
+  return trashPath;
+}
+
 async function moveToTrash(filepath) {
   if (process.env.OBSIDIAN_HARD_DELETE === 'true') {
     await fs.unlink(filepath);
@@ -966,6 +989,10 @@ class ObsidianMCPServer {
                 type: "boolean",
                 description: "Delete original notes after merge (default: false)",
               },
+              dry_run: {
+                type: "boolean",
+                description: "Preview the merge without applying changes (default: false)",
+              },
             },
             required: ["filenames", "output_filename"],
           },
@@ -1521,13 +1548,17 @@ class ObsidianMCPServer {
                 type: "string",
                 description: "Replacement text",
               },
-              filenames: {
+              scope: {
                 type: "array",
                 items: { type: "string" },
-                description: "Optional specific files to process",
+                description: "REQUIRED: list of files to process. Use [\"all\"] to operate on the full vault.",
+              },
+              dry_run: {
+                type: "boolean",
+                description: "Preview replacements without applying changes (default: false)",
               },
             },
-            required: ["pattern", "replacement"],
+            required: ["pattern", "replacement", "scope"],
           },
         },
         {
@@ -2157,6 +2188,29 @@ class ObsidianMCPServer {
             required: ["filename"],
           },
         },
+        {
+          name: "list_trash",
+          description: "List all files currently in the vault's .trash folder",
+          inputSchema: {
+            type: "object",
+            properties: {},
+            required: [],
+          },
+        },
+        {
+          name: "restore_from_trash",
+          description: "Restore a file from the vault's .trash folder back to the vault root",
+          inputSchema: {
+            type: "object",
+            properties: {
+              trash_id: {
+                type: "string",
+                description: "The trash entry filename (as returned by list_trash)",
+              },
+            },
+            required: ["trash_id"],
+          },
+        },
       ],
     }));
 
@@ -2414,6 +2468,10 @@ class ObsidianMCPServer {
           return await this.mergeNotesEnhanced(request.params.arguments);
         case "split_note_by_headings":
           return await this.splitNoteByHeadings(request.params.arguments);
+        case "list_trash":
+          return await this.listTrash(request.params.arguments);
+        case "restore_from_trash":
+          return await this.restoreFromTrash(request.params.arguments);
         default:
           throw new Error(`Unknown tool: ${request.params.name}`);
       }
@@ -4708,7 +4766,24 @@ ${noteLinks}
   }
 
   async mergeNotes(args) {
-    const { filenames, output_filename, delete_originals = false } = args;
+    const { filenames, output_filename, delete_originals = false, dry_run = false } = args;
+
+    if (!filenames || filenames.length < 2) {
+      throw new Error('mergeNotes requires at least 2 filenames');
+    }
+    if (filenames.length > BATCH_LIMIT) {
+      throw new Error(`mergeNotes: batch size ${filenames.length} exceeds limit ${BATCH_LIMIT}. Increase OBSIDIAN_BATCH_LIMIT env var if needed.`);
+    }
+
+    if (dry_run) {
+      return {
+        content: [{
+          type: "text",
+          text: `[DRY RUN] Would merge ${filenames.length} notes into "${output_filename}"${delete_originals ? ' and delete originals' : ''}.\nFiles: ${filenames.join(', ')}`,
+        }],
+      };
+    }
+
     const outputPath = safeVaultPath(OBSIDIAN_VAULT_PATH, output_filename.endsWith('.md') ? output_filename : `${output_filename}.md`);
 
     try {
@@ -4736,14 +4811,17 @@ ${noteLinks}
 
       if (delete_originals) {
         for (const filename of filenames) {
-          await fs.unlink(safeVaultPath(OBSIDIAN_VAULT_PATH, filename));
+          await moveToTrash(safeVaultPath(OBSIDIAN_VAULT_PATH, filename));
         }
       }
 
+      const deleteLabel = delete_originals
+        ? (process.env.OBSIDIAN_HARD_DELETE === 'true' ? ' (originals deleted)' : ' (originals moved to trash)')
+        : '';
       return {
         content: [{
           type: "text",
-          text: `Merged ${filenames.length} notes into ${output_filename}${delete_originals ? ' (originals deleted)' : ''}`,
+          text: `Merged ${filenames.length} notes into ${output_filename}${deleteLabel}`,
         }],
       };
     } catch (error) {
@@ -4823,6 +4901,7 @@ ${noteLinks}
       isError: true,
     };
   }
+  }
 
   async exportVaultPdf(args) {
     // SECURITY: Disabled — H-01
@@ -4836,213 +4915,6 @@ ${noteLinks}
       }],
       isError: true,
     };
-    const { filename, output_path } = args;
-    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
-
-    try {
-      const content = await fs.readFile(filepath, "utf-8");
-      const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '');
-      const html = await marked(bodyContent);
-
-      const styledHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <style>
-        @page { margin: 2cm; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 800px;
-            margin: 0 auto;
-        }
-        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 0.3em; }
-        h2 { color: #34495e; border-bottom: 1px solid #bdc3c7; padding-bottom: 0.2em; margin-top: 1.5em; }
-        h3 { color: #7f8c8d; margin-top: 1.2em; }
-        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; }
-        pre { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; overflow-x: auto; }
-        pre code { background: none; color: #ecf0f1; }
-        a { color: #3498db; text-decoration: none; }
-        blockquote { border-left: 4px solid #3498db; padding-left: 1em; color: #7f8c8d; margin: 1em 0; }
-        table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-        th { background: #3498db; color: white; }
-        img { max-width: 100%; height: auto; }
-    </style>
-</head>
-<body>
-    <h1>${filename.replace('.md', '')}</h1>
-    ${html}
-</body>
-</html>`;
-
-      const browser = await puppeteer.launch({ headless: "new" });
-      const page = await browser.newPage();
-      await page.setContent(styledHtml);
-      
-      const outputFile = output_path || filepath.replace('.md', '.pdf');
-      await page.pdf({
-        path: outputFile,
-        format: 'A4',
-        printBackground: true,
-        margin: { top: '2cm', right: '2cm', bottom: '2cm', left: '2cm' },
-      });
-
-      await browser.close();
-
-      return {
-        content: [{
-          type: "text",
-          text: `Exported to PDF: ${outputFile}`,
-        }],
-      };
-    } catch (error) {
-      return {
-        content: [{
-          type: "text",
-          text: `Error exporting to PDF: ${error.message}`,
-        }],
-        isError: true,
-      };
-    }
-  }
-
-  async exportVaultPdf(args) {
-    const { output_path, include_toc = true, organize_by = 'folder' } = args || {};
-    
-    try {
-      const files = await fs.readdir(OBSIDIAN_VAULT_PATH);
-      const mdFiles = files.filter((f) => f.endsWith(".md"));
-      
-      const notes = [];
-      for (const file of mdFiles) {
-        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
-        const content = await fs.readFile(filepath, "utf-8");
-        const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
-        
-        let title = file.replace('.md', '');
-        let tags = [];
-        let type = 'note';
-        
-        if (frontmatterMatch) {
-          const titleMatch = frontmatterMatch[1].match(/title:\s*(.+)/);
-          const tagsMatch = frontmatterMatch[1].match(/tags:\s*\[(.*?)\]/);
-          const typeMatch = frontmatterMatch[1].match(/type:\s*(.+)/);
-          
-          if (titleMatch) title = titleMatch[1];
-          if (tagsMatch) tags = tagsMatch[1].split(",").map((t) => t.trim().replace(/"/g, ""));
-          if (typeMatch) type = typeMatch[1].trim();
-        }
-        
-        const body = content.replace(/^---\n[\s\S]*?\n---\n/, '');
-        notes.push({ filename: file, title, tags, type, content: body });
-      }
-
-      let tocHtml = '';
-      let contentHtml = '';
-      let pageNum = 1;
-
-      if (include_toc) {
-        tocHtml = '<div style="page-break-after: always;"><h1>Table of Contents</h1><ul style="list-style: none; padding: 0;">';
-        notes.forEach((note, idx) => {
-          tocHtml += `<li style="margin: 0.5em 0;"><a href="#note-${idx}" style="color: #3498db;">${note.title}</a></li>`;
-        });
-        tocHtml += '</ul></div>';
-      }
-
-      for (let i = 0; i < notes.length; i++) {
-        const note = notes[i];
-        const html = await marked(note.content);
-        contentHtml += `
-<div style="page-break-before: always;" id="note-${i}">
-    <h1 style="color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 0.3em;">${note.title}</h1>
-    <p style="color: #7f8c8d; font-size: 0.9em;">Type: ${note.type} | Tags: ${note.tags.join(', ') || 'none'}</p>
-    ${html}
-</div>`;
-      }
-
-      const fullHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Vault Export - ${path.basename(OBSIDIAN_VAULT_PATH)}</title>
-    <style>
-        @page { 
-            margin: 2.5cm;
-            @top-right { content: counter(page); }
-        }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
-        }
-        h1 { color: #2c3e50; margin-top: 0; }
-        h2 { color: #34495e; border-bottom: 1px solid #bdc3c7; padding-bottom: 0.2em; margin-top: 1.5em; }
-        h3 { color: #7f8c8d; margin-top: 1.2em; }
-        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; font-size: 0.9em; }
-        pre { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; overflow-x: auto; margin: 1em 0; }
-        pre code { background: none; color: #ecf0f1; }
-        a { color: #3498db; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        blockquote { border-left: 4px solid #3498db; padding-left: 1em; color: #7f8c8d; margin: 1em 0; font-style: italic; }
-        table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-        th { background: #3498db; color: white; font-weight: 600; }
-        tr:nth-child(even) { background: #f9f9f9; }
-        img { max-width: 100%; height: auto; display: block; margin: 1em auto; }
-        ul, ol { margin: 0.5em 0; }
-        li { margin: 0.3em 0; }
-    </style>
-</head>
-<body>
-    <div style="text-align: center; padding: 4cm 0;">
-        <h1 style="font-size: 3em; margin-bottom: 0.2em;">📚 ${path.basename(OBSIDIAN_VAULT_PATH)}</h1>
-        <p style="font-size: 1.2em; color: #7f8c8d;">Complete Vault Export</p>
-        <p style="color: #95a5a6;">${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}</p>
-        <p style="color: #95a5a6;">${notes.length} notes</p>
-    </div>
-    ${tocHtml}
-    ${contentHtml}
-</body>
-</html>`;
-
-      const browser = await puppeteer.launch({ headless: "new" });
-      const page = await browser.newPage();
-      await page.setContent(fullHtml, { waitUntil: 'networkidle0' });
-      
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const outputFile = output_path || path.join(__dirname, `vault-export-${timestamp}.pdf`);
-      
-      await page.pdf({
-        path: outputFile,
-        format: 'A4',
-        printBackground: true,
-        displayHeaderFooter: true,
-        headerTemplate: '<div></div>',
-        footerTemplate: '<div style="font-size: 10px; text-align: center; width: 100%;"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
-        margin: { top: '2.5cm', right: '2.5cm', bottom: '2.5cm', left: '2.5cm' },
-      });
-
-      await browser.close();
-
-      return {
-        content: [{
-          type: "text",
-          text: `Exported ${notes.length} notes to PDF: ${outputFile}`,
-        }],
-      };
-    } catch (error) {
-      return {
-        content: [{
-          type: "text",
-          text: `Error exporting vault to PDF: ${error.message}`,
-        }],
-        isError: true,
-      };
-    }
   }
 
   async exportNoteMarkdown(args) {
@@ -6223,10 +6095,50 @@ ${noteLinks}
   // ===== ADVANCED SEARCH & REPLACE METHODS =====
 
   async regexSearchAndReplace(args) {
-    const { pattern, replacement, filenames } = args;
+    const { pattern, replacement, scope, dry_run = false } = args;
+
+    if (!scope || (Array.isArray(scope) && scope.length === 0)) {
+      throw new Error('regexSearchAndReplace requires an explicit "scope" (list of files or folder name). To operate on the full vault, pass scope: ["all"] explicitly.');
+    }
 
     try {
-      const files = filenames || (await fs.readdir(OBSIDIAN_VAULT_PATH)).filter(f => f.endsWith('.md'));
+      let files;
+      if (Array.isArray(scope) && scope.length === 1 && scope[0] === 'all') {
+        files = (await fs.readdir(OBSIDIAN_VAULT_PATH)).filter(f => f.endsWith('.md'));
+      } else {
+        files = Array.isArray(scope) ? scope : [scope];
+      }
+
+      if (files.length > REPLACE_LIMIT) {
+        throw new Error(`regexSearchAndReplace: scope contains ${files.length} files, which exceeds limit ${REPLACE_LIMIT}. Increase OBSIDIAN_REPLACE_LIMIT env var if needed.`);
+      }
+
+      const regex = new RegExp(pattern, 'g');
+
+      if (dry_run) {
+        const preview = [];
+        for (const file of files) {
+          const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
+          try {
+            const fileContent = await fs.readFile(filepath, 'utf-8');
+            const matches = (fileContent.match(regex) || []).length;
+            if (matches > 0) {
+              preview.push(`  ${file}: ${matches} match(es)`);
+            }
+          } catch (e) {
+            // Skip files that can't be read
+          }
+        }
+        return {
+          content: [{
+            type: "text",
+            text: `[DRY RUN] Would replace pattern /${pattern}/ with "${replacement}" across ${files.length} file(s).\nFiles with matches:\n${preview.length > 0 ? preview.join('\n') : '  (none)'}`,
+          }],
+        };
+      }
+
+      let totalReplacements = 0;
+
       const regex = new RegExp(pattern, 'g');
       let totalReplacements = 0;
 
@@ -7830,6 +7742,72 @@ Note: For full version history, use a git repository or Obsidian Sync.
           type: "text",
           text: `Error splitting note: ${error.message}`,
         }],
+        isError: true,
+      };
+    }
+  }
+
+  async listTrash(args) {
+    const trashDir = path.join(OBSIDIAN_VAULT_PATH, '.trash');
+    try {
+      const files = await fs.readdir(trashDir);
+      const items = files.map(f => {
+        const parts = f.match(/^(\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}Z)_(.+)$/);
+        return parts
+          ? { trash_id: f, original_name: parts[2], deleted_at: parts[1].replace(/-/g, (m, o) => o > 18 ? ':' : m) }
+          : { trash_id: f, original_name: f };
+      });
+      return { content: [{ type: "text", text: JSON.stringify(items, null, 2) }] };
+    } catch {
+      return { content: [{ type: "text", text: "Trash is empty or does not exist." }] };
+    }
+  }
+
+  async restoreFromTrash(args) {
+    const { trash_id } = args;
+    const trashPath = path.join(OBSIDIAN_VAULT_PATH, '.trash', trash_id);
+    const parts = trash_id.match(/^\\d{4}-\\d{2}-\\d{2}T[\\d-]+Z_(.+)$/);
+    const originalName = parts ? parts[1] : trash_id;
+    const restorePath = path.join(OBSIDIAN_VAULT_PATH, originalName);
+    try {
+      await fs.rename(trashPath, restorePath);
+      return { content: [{ type: "text", text: `Restored "${originalName}" from trash.` }] };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error restoring from trash: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+
+  async listTrash(args) {
+    const trashDir = path.join(OBSIDIAN_VAULT_PATH, '.trash');
+    try {
+      const files = await fs.readdir(trashDir);
+      const items = files.map(f => {
+        const parts = f.match(/^(\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}Z)_(.+)$/);
+        return parts
+          ? { trash_id: f, original_name: parts[2], deleted_at: parts[1].replace(/-/g, (m, o) => o > 18 ? ':' : m) }
+          : { trash_id: f, original_name: f };
+      });
+      return { content: [{ type: "text", text: JSON.stringify(items, null, 2) }] };
+    } catch {
+      return { content: [{ type: "text", text: "Trash is empty or does not exist." }] };
+    }
+  }
+
+  async restoreFromTrash(args) {
+    const { trash_id } = args;
+    const trashPath = path.join(OBSIDIAN_VAULT_PATH, '.trash', trash_id);
+    const parts = trash_id.match(/^\\d{4}-\\d{2}-\\d{2}T[\\d-]+Z_(.+)$/);
+    const originalName = parts ? parts[1] : trash_id;
+    const restorePath = path.join(OBSIDIAN_VAULT_PATH, originalName);
+    try {
+      await fs.rename(trashPath, restorePath);
+      return { content: [{ type: "text", text: `Restored "${originalName}" from trash.` }] };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error restoring from trash: ${error.message}` }],
         isError: true,
       };
     }
