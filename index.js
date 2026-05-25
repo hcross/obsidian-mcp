@@ -13,6 +13,62 @@ import dotenv from "dotenv";
 import { marked } from "marked";
 import puppeteer from "puppeteer";
 import { parse } from "json2csv";
+import yaml from "js-yaml";
+import DOMPurify from "isomorphic-dompurify";
+import safeRegex from "safe-regex2";
+
+/**
+ * Safely builds a YAML frontmatter block using js-yaml serialization.
+ * Prevents YAML injection by properly escaping all field values.
+ * Undefined/null fields are omitted to avoid polluting the frontmatter.
+ * @param {Object} fields - Key/value pairs to include in the frontmatter
+ * @returns {string} - A complete frontmatter block including --- delimiters
+ */
+function buildFrontmatter(fields) {
+  const clean = Object.fromEntries(
+    Object.entries(fields).filter(([, v]) => v !== undefined && v !== null)
+  );
+  return `---\n${yaml.dump(clean, { lineWidth: -1 })}---\n`;
+}
+
+// Allowlist-based HTML sanitization — blocks XSS while preserving rich Markdown output
+const SAFE_HTML_CONFIG = {
+  ALLOWED_TAGS: [
+    'p', 'br', 'hr',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'strong', 'em', 'b', 'i', 'u', 's', 'del', 'ins',
+    'code', 'pre', 'kbd', 'samp',
+    'blockquote', 'q', 'cite',
+    'ul', 'ol', 'li', 'dl', 'dt', 'dd',
+    'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td', 'caption',
+    'a', 'abbr', 'acronym',
+    'img',
+    'figure', 'figcaption',
+    'div', 'span',
+    'sup', 'sub',
+    'details', 'summary',
+  ],
+  ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'class', 'id', 'target', 'rel', 'width', 'height'],
+  ALLOW_DATA_ATTR: false,
+  FORCE_BODY: true,
+};
+
+function sanitizeHtml(rawHtml) {
+  return DOMPurify.sanitize(rawHtml, SAFE_HTML_CONFIG);
+}
+
+/**
+ * Compile a user-supplied regex pattern safely, rejecting ReDoS-prone patterns.
+ * All MCP tools accepting user-controlled patterns MUST use this function.
+ */
+function compileUserRegex(pattern, flags = '') {
+  if (typeof pattern !== 'string') throw new Error('Regex pattern must be a string');
+  if (pattern.length > 500) throw new Error('Regex pattern too long (max 500 chars)');
+  if (!safeRegex(pattern)) {
+    throw new Error(`Unsafe regex pattern rejected (potential ReDoS): ${pattern.substring(0, 50)}`);
+  }
+  return new RegExp(pattern, flags);
+}
 
 // Load .env file from the same directory as this script
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -23,6 +79,165 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 // OBSIDIAN_VAULT_PATH: the currently active vault
 const VAULTS_BASE_PATH = process.env.VAULTS_BASE_PATH || process.cwd();
 let OBSIDIAN_VAULT_PATH = process.env.OBSIDIAN_VAULT_PATH || path.join(VAULTS_BASE_PATH, "CodeSnippets");
+
+// Guardrail limits for bulk destructive operations (H-05, H-06) and rate limiting (M-04, M-07)
+const BATCH_LIMIT = parseInt(process.env.OBSIDIAN_BATCH_LIMIT) || 50;
+const REPLACE_LIMIT = parseInt(process.env.OBSIDIAN_REPLACE_LIMIT) || 100;
+const SEARCH_RESULT_LIMIT = parseInt(process.env.OBSIDIAN_SEARCH_LIMIT) || 500;
+const QUERY_TIMEOUT_MS = parseInt(process.env.OBSIDIAN_QUERY_TIMEOUT_MS) || 10000;
+
+/**
+ * Wraps a promise with a timeout to prevent indefinite blocking (M-07).
+ *
+ * @param {Promise} promise       - The promise to race against the timeout
+ * @param {number}  ms            - Timeout in milliseconds
+ * @param {string}  operationName - Label used in the rejection error message
+ * @returns {Promise}
+ */
+function withTimeout(promise, ms, operationName) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`${operationName} timed out after ${ms}ms`)),
+        ms
+      )
+    ),
+  ]);
+}
+
+/**
+ * Resolves a user-supplied path relative to the vault base and ensures it
+ * stays within the vault boundary (no path traversal).
+ *
+ * @param {string} base      - Absolute vault root (OBSIDIAN_VAULT_PATH)
+ * @param {string} userInput - Relative path provided by the caller
+ * @returns {string} Fully-resolved, safe absolute path
+ * @throws {Error} If the resolved path escapes the vault
+ */
+function safeVaultPath(base, userInput) {
+  if (typeof userInput !== 'string') throw new Error('Path must be a string');
+  const vaultBase = path.resolve(base);
+  const resolved = path.resolve(vaultBase, userInput);
+  if (!resolved.startsWith(vaultBase + path.sep) && resolved !== vaultBase) {
+    throw new Error(`Path traversal detected: "${userInput}" resolves outside vault`);
+  }
+  return resolved;
+}
+
+async function safeOutputPath(userOutputPath, defaultFilename) {
+  const exportsDir = process.env.OBSIDIAN_EXPORTS_DIR ? path.resolve(process.env.OBSIDIAN_EXPORTS_DIR) : path.resolve(OBSIDIAN_VAULT_PATH, '.exports');
+  await fs.mkdir(exportsDir, { recursive: true });
+  if (!userOutputPath) return path.join(exportsDir, defaultFilename);
+  const resolved = path.resolve(userOutputPath);
+  const vaultBase = path.resolve(OBSIDIAN_VAULT_PATH);
+  if (!resolved.startsWith(vaultBase + path.sep) && !resolved.startsWith(exportsDir + path.sep) && resolved !== vaultBase) {
+    throw new Error(`Export path "${userOutputPath}" must be within vault or OBSIDIAN_EXPORTS_DIR. Set OBSIDIAN_EXPORTS_DIR env var to allow a custom export directory.`);
+  }
+  return resolved;
+}
+
+/**
+ * Moves a file to the vault's .trash directory instead of permanently deleting it.
+ * If OBSIDIAN_HARD_DELETE=true, performs permanent deletion instead.
+ *
+ * @param {string} filepath - Absolute path of the file to trash
+ * @returns {string|null} Trash path if moved, null if hard-deleted
+ */
+async function moveToTrash(filepath) {
+  if (process.env.OBSIDIAN_HARD_DELETE === 'true') {
+    await fs.unlink(filepath);
+    return null;
+  }
+
+  const trashDir = path.join(OBSIDIAN_VAULT_PATH, '.trash');
+  await fs.mkdir(trashDir, { recursive: true });
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const basename = path.basename(filepath);
+  const trashName = `${timestamp}_${basename}`;
+  const trashPath = path.join(trashDir, trashName);
+
+  await fs.rename(filepath, trashPath);
+  return trashPath;
+}
+
+/**
+ * Append-only NDJSON audit logger for sensitive vault operations (M-08).
+ *
+ * Privacy contract: only operation metadata is logged — note content,
+ * body, and any free-text fields are never written to disk.
+ * The log file lives inside the vault as <vault>/.mcp-audit.log.
+ */
+class AuditLogger {
+  constructor(vaultPath) {
+    this.logPath = path.join(vaultPath, '.mcp-audit.log');
+    this.maxEntries = parseInt(process.env.OBSIDIAN_AUDIT_MAX_ENTRIES) || 10000;
+    this.enabled = process.env.OBSIDIAN_AUDIT_LOG !== 'false';
+  }
+
+  async log(operation, args, result) {
+    if (!this.enabled) return;
+
+    // Log metadata only — never note content
+    const safeArgs = this._sanitizeArgs(args);
+
+    const entry = JSON.stringify({
+      ts: new Date().toISOString(),
+      op: operation,
+      args: safeArgs,
+      result: result === 'ok' ? 'ok' : 'error',
+      ...(result !== 'ok' ? { error: String(result).substring(0, 100) } : {}),
+    }) + '\n';
+
+    try {
+      await fs.appendFile(this.logPath, entry, 'utf-8');
+      await this._rotate();
+    } catch {
+      // Audit log must never block normal operations
+    }
+  }
+
+  _sanitizeArgs(args) {
+    if (!args) return {};
+    // Retain only non-content fields — never include "content", "body", "text", etc.
+    const safe = {};
+    const allowedKeys = [
+      'filename', 'folder_path', 'destination_folder',
+      'old_filename', 'new_filename', 'output_path',
+      'tags', 'delete_originals', 'dry_run',
+      'source_path', 'dest_name', 'last_n', 'trash_id',
+      'filenames', 'output_filename', 'pattern', 'replacement',
+    ];
+    for (const key of allowedKeys) {
+      if (args[key] !== undefined) safe[key] = args[key];
+    }
+    return safe;
+  }
+
+  async _rotate() {
+    try {
+      const content = await fs.readFile(this.logPath, 'utf-8');
+      const lines = content.trim().split('\n');
+      if (lines.length > this.maxEntries) {
+        const trimmed = lines.slice(-this.maxEntries).join('\n') + '\n';
+        await fs.writeFile(this.logPath, trimmed, 'utf-8');
+      }
+    } catch {
+      // Skip rotation if file is unreadable
+    }
+  }
+
+  async getLast(n = 50) {
+    try {
+      const content = await fs.readFile(this.logPath, 'utf-8');
+      const lines = content.trim().split('\n').filter(Boolean);
+      return lines.slice(-n).map(l => JSON.parse(l));
+    } catch {
+      return [];
+    }
+  }
+}
 
 class ObsidianMCPServer {
   constructor() {
@@ -38,6 +253,7 @@ class ObsidianMCPServer {
       }
     );
 
+    this.audit = new AuditLogger(OBSIDIAN_VAULT_PATH);
     this.setupToolHandlers();
     this.server.onerror = (error) => console.error("[MCP Error]", error);
     process.on("SIGINT", async () => {
@@ -867,6 +1083,10 @@ class ObsidianMCPServer {
                 type: "boolean",
                 description: "Delete original notes after merge (default: false)",
               },
+              dry_run: {
+                type: "boolean",
+                description: "Preview the merge without applying changes (default: false)",
+              },
             },
             required: ["filenames", "output_filename"],
           },
@@ -905,7 +1125,7 @@ class ObsidianMCPServer {
         },
         {
           name: "export_note_pdf",
-          description: "Export a single note as a beautifully formatted PDF",
+          description: "[DISABLED — security risk H-01] Puppeteer-based PDF export is disabled. Use export_note_html instead and convert to PDF locally.",
           inputSchema: {
             type: "object",
             properties: {
@@ -923,7 +1143,7 @@ class ObsidianMCPServer {
         },
         {
           name: "export_vault_pdf",
-          description: "Export entire vault as a single PDF with table of contents and navigation",
+          description: "[DISABLED — security risk H-01] Puppeteer-based PDF export is disabled. Use export_vault_markdown_bundle or export_vault_json instead.",
           inputSchema: {
             type: "object",
             properties: {
@@ -1422,13 +1642,17 @@ class ObsidianMCPServer {
                 type: "string",
                 description: "Replacement text",
               },
-              filenames: {
+              scope: {
                 type: "array",
                 items: { type: "string" },
-                description: "Optional specific files to process",
+                description: "REQUIRED: list of files to process. Use [\"all\"] to operate on the full vault.",
+              },
+              dry_run: {
+                type: "boolean",
+                description: "Preview replacements without applying changes (default: false)",
               },
             },
-            required: ["pattern", "replacement"],
+            required: ["pattern", "replacement", "scope"],
           },
         },
         {
@@ -2058,6 +2282,39 @@ class ObsidianMCPServer {
             required: ["filename"],
           },
         },
+        {
+          name: "list_trash",
+          description: "List all files currently in the vault's .trash folder",
+          inputSchema: {
+            type: "object",
+            properties: {},
+            required: [],
+          },
+        },
+        {
+          name: "restore_from_trash",
+          description: "Restore a file from the vault's .trash folder back to the vault root",
+          inputSchema: {
+            type: "object",
+            properties: {
+              trash_id: {
+                type: "string",
+                description: "The trash entry filename (as returned by list_trash)",
+              },
+            },
+            required: ["trash_id"],
+          name: "get_audit_log",
+          description: "Retrieve recent audit log entries for sensitive operations",
+          inputSchema: {
+            type: "object",
+            properties: {
+              last_n: {
+                type: "number",
+                description: "Number of recent entries to return (default: 50, max: 200)",
+              },
+            },
+          },
+        },
       ],
     }));
 
@@ -2315,6 +2572,12 @@ class ObsidianMCPServer {
           return await this.mergeNotesEnhanced(request.params.arguments);
         case "split_note_by_headings":
           return await this.splitNoteByHeadings(request.params.arguments);
+        case "list_trash":
+          return await this.listTrash(request.params.arguments);
+        case "restore_from_trash":
+          return await this.restoreFromTrash(request.params.arguments);
+        case "get_audit_log":
+          return await this.getAuditLog(request.params.arguments);
         default:
           throw new Error(`Unknown tool: ${request.params.name}`);
       }
@@ -2325,18 +2588,17 @@ class ObsidianMCPServer {
     const { title, code, language, description, tags = [] } = args;
     const timestamp = new Date().toISOString();
     const filename = this.sanitizeFilename(title) + ".md";
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     const relatedNotes = await this.findRelatedNotes(tags, language);
 
-    const content = `---
-title: ${title}
-type: code-snippet
-language: ${language}
-created: ${timestamp}
-tags: [${tags.map((t) => `"${t}"`).join(", ")}]
----
-
+    const content = buildFrontmatter({
+      title,
+      type: "code-snippet",
+      language,
+      created: timestamp,
+      tags,
+    }) + `
 # ${title}
 
 ${description ? `## Description\n\n${description}\n\n` : ""}## Code
@@ -2369,18 +2631,17 @@ ${relatedNotes.length > 0 ? `## Related Notes\n\n${relatedNotes.map(note => `- [
     const { title, summary, key_insights = [], code_snippets = [], tags = [] } = args;
     const timestamp = new Date().toISOString();
     const filename = this.sanitizeFilename(title) + ".md";
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     const languages = [...new Set(code_snippets.map(s => s.language).filter(Boolean))];
     const relatedNotes = await this.findRelatedNotes(tags, languages.join(','));
 
-    let content = `---
-title: ${title}
-type: thread-summary
-created: ${timestamp}
-tags: [${tags.map((t) => `"${t}"`).join(", ")}]
----
-
+    let content = buildFrontmatter({
+      title,
+      type: "thread-summary",
+      created: timestamp,
+      tags,
+    }) + `
 # ${title}
 
 ## Summary
@@ -2427,17 +2688,16 @@ ${relatedNotes.length > 0 ? `## Related Notes\n\n${relatedNotes.map(note => `- [
     const { title, content, tags = [] } = args;
     const timestamp = new Date().toISOString();
     const filename = this.sanitizeFilename(title) + ".md";
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     const relatedNotes = await this.findRelatedNotes(tags, null);
 
-    const noteContent = `---
-title: ${title}
-type: knowledge-note
-created: ${timestamp}
-tags: [${tags.map((t) => `"${t}"`).join(", ")}]
----
-
+    const noteContent = buildFrontmatter({
+      title,
+      type: "knowledge-note",
+      created: timestamp,
+      tags,
+    }) + `
 # ${title}
 
 ${content}
@@ -2467,7 +2727,7 @@ ${relatedNotes.length > 0 ? `\n## Related Notes\n\n${relatedNotes.map(note => `-
 
     let notes = [];
     for (const file of mdFiles) {
-      const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
       const content = await fs.readFile(filepath, "utf-8");
       
       const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
@@ -2495,11 +2755,15 @@ ${relatedNotes.length > 0 ? `\n## Related Notes\n\n${relatedNotes.map(note => `-
       }
     }
 
+    const truncated = notes.length > SEARCH_RESULT_LIMIT;
+    const limitedNotes = notes.slice(0, SEARCH_RESULT_LIMIT);
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(notes, null, 2),
+          text: JSON.stringify(limitedNotes, null, 2) +
+            (truncated ? `\n\n[Results truncated: showing ${SEARCH_RESULT_LIMIT} of ${notes.length} notes. Set OBSIDIAN_SEARCH_LIMIT to increase.]` : ""),
         },
       ],
     };
@@ -2507,7 +2771,7 @@ ${relatedNotes.length > 0 ? `\n## Related Notes\n\n${relatedNotes.map(note => `-
 
   async readNote(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -2539,7 +2803,7 @@ ${relatedNotes.length > 0 ? `\n## Related Notes\n\n${relatedNotes.map(note => `-
 
     let results = [];
     for (const file of mdFiles) {
-      const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
       const content = await fs.readFile(filepath, "utf-8");
 
       let matches = false;
@@ -2580,12 +2844,16 @@ ${relatedNotes.length > 0 ? `\n## Related Notes\n\n${relatedNotes.map(note => `-
       }
     }
 
+    const truncated = results.length > SEARCH_RESULT_LIMIT;
+    const limitedResults = results.slice(0, SEARCH_RESULT_LIMIT);
+
     return {
       content: [
         {
           type: "text",
-          text: results.length > 0 
-            ? JSON.stringify(results, null, 2)
+          text: limitedResults.length > 0
+            ? JSON.stringify(limitedResults, null, 2) +
+              (truncated ? `\n\n[Results truncated: showing ${SEARCH_RESULT_LIMIT} of ${results.length} matches. Set OBSIDIAN_SEARCH_LIMIT to increase.]` : "")
             : "No matching notes found",
         },
       ],
@@ -2614,6 +2882,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
 `;
 
       await fs.writeFile(path.join(vaultPath, "Welcome.md"), welcomeContent, "utf-8");
+      await this.audit.log('createVault', args, 'ok');
 
       return {
         content: [
@@ -2624,6 +2893,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
         ],
       };
     } catch (error) {
+      await this.audit.log('createVault', args, error.message);
       return {
         content: [
           {
@@ -2672,37 +2942,17 @@ Start saving code snippets, thread summaries, and knowledge notes!
     }
   }
 
-  async switchVault(args) {
-    const { name } = args;
-    const vaultPath = path.join(VAULTS_BASE_PATH, name);
-
-    try {
-      const stats = await fs.stat(vaultPath);
-      if (!stats.isDirectory()) {
-        throw new Error(`${name} is not a directory`);
-      }
-
-      OBSIDIAN_VAULT_PATH = vaultPath;
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Switched to vault "${name}"`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error switching vault: ${error.message}. Vault may not exist.`,
-          },
-        ],
-        isError: true,
-      };
-    }
+  async switchVault(_args) {
+    // C-02 fix: runtime vault switching disabled — it allowed bypassing the vault
+    // boundary by overwriting the global OBSIDIAN_VAULT_PATH at runtime.
+    // Use the OBSIDIAN_VAULT_PATH environment variable and restart the server instead.
+    return {
+      content: [{
+        type: "text",
+        text: "Switching vault requires restarting the MCP server with the new OBSIDIAN_VAULT_PATH environment variable. Runtime vault switching is disabled for security reasons.",
+      }],
+      isError: true,
+    };
   }
 
   async findRelatedNotes(tags = [], language = null) {
@@ -2713,7 +2963,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
       const relatedNotes = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
 
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
@@ -2770,7 +3020,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async updateNote(args) {
     const { filename, content, preserve_metadata = true } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let finalContent = content;
@@ -2786,6 +3036,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
       }
 
       await fs.writeFile(filepath, finalContent, "utf-8");
+      await this.audit.log('updateNote', args, 'ok');
 
       return {
         content: [{
@@ -2794,6 +3045,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
         }],
       };
     } catch (error) {
+      await this.audit.log('updateNote', args, error.message);
       return {
         content: [{
           type: "text",
@@ -2806,17 +3058,22 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async deleteNote(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
-      await fs.unlink(filepath);
+      const trashPath = await moveToTrash(filepath);
+      const message = trashPath
+        ? `Successfully moved ${filename} to trash (${path.basename(trashPath)})`
+        : `Successfully deleted ${filename}`;
+      await this.audit.log('deleteNote', args, 'ok');
       return {
         content: [{
           type: "text",
-          text: `Successfully deleted ${filename}`,
+          text: message,
         }],
       };
     } catch (error) {
+      await this.audit.log('deleteNote', args, error.message);
       return {
         content: [{
           type: "text",
@@ -2829,12 +3086,13 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async appendToNote(args) {
     const { filename, content } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const existingContent = await fs.readFile(filepath, "utf-8");
       const newContent = existingContent + "\n\n" + content;
       await fs.writeFile(filepath, newContent, "utf-8");
+      await this.audit.log('appendToNote', args, 'ok');
 
       return {
         content: [{
@@ -2843,6 +3101,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
         }],
       };
     } catch (error) {
+      await this.audit.log('appendToNote', args, error.message);
       return {
         content: [{
           type: "text",
@@ -2855,7 +3114,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async createFolder(args) {
     const { folder_path } = args;
-    const fullPath = path.join(OBSIDIAN_VAULT_PATH, folder_path);
+    const fullPath = safeVaultPath(OBSIDIAN_VAULT_PATH, folder_path);
 
     try {
       await fs.mkdir(fullPath, { recursive: true });
@@ -2878,13 +3137,14 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async moveNote(args) {
     const { filename, destination_folder } = args;
-    const sourcePath = path.join(OBSIDIAN_VAULT_PATH, filename);
-    const destFolder = path.join(OBSIDIAN_VAULT_PATH, destination_folder);
+    const sourcePath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
+    const destFolder = safeVaultPath(OBSIDIAN_VAULT_PATH, destination_folder);
     const destPath = path.join(destFolder, filename);
 
     try {
       await fs.mkdir(destFolder, { recursive: true });
       await fs.rename(sourcePath, destPath);
+      await this.audit.log('moveNote', args, 'ok');
       
       return {
         content: [{
@@ -2893,6 +3153,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
         }],
       };
     } catch (error) {
+      await this.audit.log('moveNote', args, error.message);
       return {
         content: [{
           type: "text",
@@ -2905,12 +3166,13 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async renameNote(args) {
     const { old_filename, new_filename } = args;
-    const oldPath = path.join(OBSIDIAN_VAULT_PATH, old_filename);
+    const oldPath = safeVaultPath(OBSIDIAN_VAULT_PATH, old_filename);
     const newFilename = new_filename.endsWith('.md') ? new_filename : `${new_filename}.md`;
-    const newPath = path.join(OBSIDIAN_VAULT_PATH, newFilename);
+    const newPath = safeVaultPath(OBSIDIAN_VAULT_PATH, newFilename);
 
     try {
       await fs.rename(oldPath, newPath);
+      await this.audit.log('renameNote', args, 'ok');
       
       return {
         content: [{
@@ -2919,6 +3181,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
         }],
       };
     } catch (error) {
+      await this.audit.log('renameNote', args, error.message);
       return {
         content: [{
           type: "text",
@@ -2931,7 +3194,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async addTags(args) {
     const { filename, tags } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -2947,25 +3210,12 @@ Start saving code snippets, thread summaries, and knowledge notes!
         };
       }
 
-      const frontmatter = frontmatterMatch[1];
-      const tagsMatch = frontmatter.match(/tags:\s*\[(.*?)\]/);
-      
-      let existingTags = [];
-      if (tagsMatch) {
-        existingTags = tagsMatch[1].split(",").map((t) => t.trim().replace(/"/g, ""));
-      }
-
-      const newTags = [...new Set([...existingTags, ...tags])];
-      const tagsString = newTags.map((t) => `"${t}"`).join(", ");
-      
-      let newFrontmatter;
-      if (tagsMatch) {
-        newFrontmatter = frontmatter.replace(/tags:\s*\[.*?\]/, `tags: [${tagsString}]`);
-      } else {
-        newFrontmatter = frontmatter + `\ntags: [${tagsString}]`;
-      }
-
-      const newContent = content.replace(/^---\n[\s\S]*?\n---/, `---\n${newFrontmatter}\n---`);
+      // Parse existing frontmatter, merge tags, and re-serialize safely
+      const parsed = yaml.load(frontmatterMatch[1]) || {};
+      const existingTags = Array.isArray(parsed.tags) ? parsed.tags : (parsed.tags ? [parsed.tags] : []);
+      parsed.tags = [...new Set([...existingTags, ...tags])];
+      const serialized = `---\n${yaml.dump(parsed, { lineWidth: -1 })}---`;
+      const newContent = content.replace(frontmatterMatch[0], serialized);
       await fs.writeFile(filepath, newContent, "utf-8");
 
       return {
@@ -2987,7 +3237,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async removeTags(args) {
     const { filename, tags } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -3015,12 +3265,10 @@ Start saving code snippets, thread summaries, and knowledge notes!
         };
       }
 
-      const existingTags = tagsMatch[1].split(",").map((t) => t.trim().replace(/"/g, ""));
       const remainingTags = existingTags.filter(t => !tags.includes(t));
-      const tagsString = remainingTags.map((t) => `"${t}"`).join(", ");
-      
-      const newFrontmatter = frontmatter.replace(/tags:\s*\[.*?\]/, `tags: [${tagsString}]`);
-      const newContent = content.replace(/^---\n[\s\S]*?\n---/, `---\n${newFrontmatter}\n---`);
+      parsed.tags = remainingTags;
+      const serialized = `---\n${yaml.dump(parsed, { lineWidth: -1 })}---`;
+      const newContent = content.replace(frontmatterMatch[0], serialized);
       await fs.writeFile(filepath, newContent, "utf-8");
 
       return {
@@ -3047,7 +3295,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
       const allTags = new Set();
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -3092,7 +3340,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
       const mdFiles = files.filter((f) => f.endsWith(".md") && f !== filename);
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         
         const linkPattern = new RegExp(`\\[\\[${noteName}[\\]|]`, 'g');
@@ -3133,7 +3381,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
     const today = new Date();
     const dateStr = today.toISOString().split('T')[0];
     const filename = `${dateStr}.md`;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const exists = await fs.access(filepath).then(() => true).catch(() => false);
@@ -3146,13 +3394,12 @@ Start saving code snippets, thread summaries, and knowledge notes!
         };
       }
 
-      const content = template_content || `---
-title: Daily Note ${dateStr}
-type: daily-note
-created: ${today.toISOString()}
-tags: ["daily"]
----
-
+      const content = template_content || buildFrontmatter({
+        title: `Daily Note ${dateStr}`,
+        type: "daily-note",
+        created: today.toISOString(),
+        tags: ["daily"],
+      }) + `
 # ${dateStr}
 
 ## Tasks
@@ -3195,7 +3442,7 @@ tags: ["daily"]
       const noteTypes = {};
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         
         const words = content.split(/\s+/).length;
@@ -3257,7 +3504,7 @@ tags: ["daily"]
       const brokenLinks = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         
         const links = content.match(/\[\[(.*?)\]\]/g) || [];
@@ -3298,7 +3545,7 @@ tags: ["daily"]
 
   async exportNoteHtml(args) {
     const { filename, output_path } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -3334,11 +3581,11 @@ tags: ["daily"]
     </style>
 </head>
 <body>
-${bodyContent}
+${sanitizeHtml(bodyContent)}
 </body>
 </html>`;
 
-      const outputFile = output_path || filepath.replace('.md', '.html');
+      const outputFile = await safeOutputPath(output_path, 'note-export.html');
       await fs.writeFile(outputFile, html, "utf-8");
 
       return {
@@ -3360,7 +3607,7 @@ ${bodyContent}
 
   async suggestTags(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -3371,7 +3618,7 @@ ${bodyContent}
       const existingTags = new Set();
 
       for (const file of mdFiles) {
-        const fp = path.join(OBSIDIAN_VAULT_PATH, file);
+        const fp = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const fc = await fs.readFile(fp, "utf-8");
         const fm = fc.match(/^---\n([\s\S]*?)\n---/);
         if (fm) {
@@ -3439,7 +3686,7 @@ ${bodyContent}
       const results = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const stats = await fs.stat(filepath);
         const content = await fs.readFile(filepath, "utf-8");
         
@@ -3494,7 +3741,7 @@ ${bodyContent}
       const orphans = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const noteName = file.replace('.md', '');
         
@@ -3503,7 +3750,7 @@ ${bodyContent}
         let hasIncomingLinks = false;
         for (const otherFile of mdFiles) {
           if (otherFile === file) continue;
-          const otherPath = path.join(OBSIDIAN_VAULT_PATH, otherFile);
+          const otherPath = safeVaultPath(OBSIDIAN_VAULT_PATH, otherFile);
           const otherContent = await fs.readFile(otherPath, "utf-8");
           if (otherContent.includes(`[[${noteName}`)) {
             hasIncomingLinks = true;
@@ -3543,7 +3790,7 @@ ${bodyContent}
       const untagged = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -3582,13 +3829,13 @@ ${bodyContent}
     const { pattern, case_sensitive = false } = args;
     
     try {
-      const regex = new RegExp(pattern, case_sensitive ? 'g' : 'gi');
+      const regex = compileUserRegex(pattern, case_sensitive ? 'g' : 'gi');
       const files = await fs.readdir(OBSIDIAN_VAULT_PATH);
       const mdFiles = files.filter((f) => f.endsWith(".md"));
       const results = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const matches = content.match(regex);
         
@@ -3631,7 +3878,7 @@ ${bodyContent}
       const results = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const wordCount = content.split(/\s+/).length;
         
@@ -3675,7 +3922,7 @@ ${bodyContent}
       const todos = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const lines = content.split('\n');
         
@@ -3725,7 +3972,7 @@ ${bodyContent}
 
   async markTaskComplete(args) {
     const { filename, task_text } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -3772,7 +4019,7 @@ ${bodyContent}
       const tasksByFile = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const pending = (content.match(/^[-*]\s+\[ \]/gm) || []).length;
         const completed = (content.match(/^[-*]\s+\[x\]/gim) || []).length;
@@ -3817,18 +4064,17 @@ ${bodyContent}
   async createTaskNote(args) {
     const { title, tasks } = args;
     const filename = this.sanitizeFilename(title) + ".md";
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
     const timestamp = new Date().toISOString();
 
     const taskList = tasks.map(task => `- [ ] ${task}`).join('\n');
     
-    const content = `---
-title: ${title}
-type: task-list
-created: ${timestamp}
-tags: ["tasks"]
----
-
+    const content = buildFrontmatter({
+      title,
+      type: "task-list",
+      created: timestamp,
+      tags: ["tasks"],
+    }) + `
 # ${title}
 
 ${taskList}
@@ -3866,7 +4112,7 @@ ${taskList}
       const todos = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
@@ -3918,7 +4164,7 @@ ${taskList}
 
   async createTemplate(args) {
     const { template_name, content } = args;
-    const templateDir = path.join(OBSIDIAN_VAULT_PATH, '.templates');
+    const templateDir = safeVaultPath(OBSIDIAN_VAULT_PATH, '.templates');
     const filepath = path.join(templateDir, `${this.sanitizeFilename(template_name)}.template.md`);
 
     try {
@@ -3944,9 +4190,9 @@ ${taskList}
 
   async applyTemplate(args) {
     const { template_name, filename, variables = {} } = args;
-    const templateDir = path.join(OBSIDIAN_VAULT_PATH, '.templates');
+    const templateDir = safeVaultPath(OBSIDIAN_VAULT_PATH, '.templates');
     const templatePath = path.join(templateDir, `${this.sanitizeFilename(template_name)}.template.md`);
-    const outputPath = path.join(OBSIDIAN_VAULT_PATH, filename.endsWith('.md') ? filename : `${filename}.md`);
+    const outputPath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename.endsWith('.md') ? filename : `${filename}.md`);
 
     try {
       let content = await fs.readFile(templatePath, "utf-8");
@@ -3979,7 +4225,7 @@ ${taskList}
   }
 
   async listTemplates(args) {
-    const templateDir = path.join(OBSIDIAN_VAULT_PATH, '.templates');
+    const templateDir = safeVaultPath(OBSIDIAN_VAULT_PATH, '.templates');
 
     try {
       const exists = await fs.access(templateDir).then(() => true).catch(() => false);
@@ -4016,7 +4262,7 @@ ${taskList}
 
   async suggestLinks(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -4028,7 +4274,7 @@ ${taskList}
       for (const file of mdFiles) {
         const noteName = file.replace('.md', '');
         if (bodyContent.includes(noteName.toLowerCase()) && !content.includes(`[[${noteName}`)) {
-          const otherPath = path.join(OBSIDIAN_VAULT_PATH, file);
+          const otherPath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
           const otherContent = await fs.readFile(otherPath, "utf-8");
           const otherWords = new Set(otherContent.toLowerCase().split(/\s+/));
           const thisWords = new Set(bodyContent.split(/\s+/));
@@ -4068,7 +4314,7 @@ ${taskList}
   async createMoc(args) {
     const { title, tag } = args;
     const filename = this.sanitizeFilename(title) + ".md";
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const files = await fs.readdir(OBSIDIAN_VAULT_PATH);
@@ -4076,7 +4322,7 @@ ${taskList}
       const relatedNotes = [];
 
       for (const file of mdFiles) {
-        const filePath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filePath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filePath, "utf-8");
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -4097,13 +4343,12 @@ ${taskList}
 
       const noteLinks = relatedNotes.map(note => `- [[${note.filename.replace('.md', '')}|${note.title}]]`).join('\n');
       
-      const content = `---
-title: ${title}
-type: moc
-created: ${new Date().toISOString()}
-tags: ["${tag}", "moc"]
----
-
+      const content = buildFrontmatter({
+        title,
+        type: "moc",
+        created: new Date().toISOString(),
+        tags: [tag, "moc"],
+      }) + `
 # ${title}
 
 > A Map of Content for notes tagged with #${tag}
@@ -4144,7 +4389,7 @@ ${noteLinks}
       const graph = { nodes: [], links: [] };
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const noteName = file.replace('.md', '');
         
@@ -4187,7 +4432,7 @@ ${noteLinks}
       const connections = new Map();
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const noteName = file.replace('.md', '');
         
@@ -4196,7 +4441,7 @@ ${noteLinks}
         let incoming = 0;
         for (const otherFile of mdFiles) {
           if (otherFile === file) continue;
-          const otherPath = path.join(OBSIDIAN_VAULT_PATH, otherFile);
+          const otherPath = safeVaultPath(OBSIDIAN_VAULT_PATH, otherFile);
           const otherContent = await fs.readFile(otherPath, "utf-8");
           if (otherContent.includes(`[[${noteName}`)) {
             incoming++;
@@ -4237,7 +4482,7 @@ ${noteLinks}
 
   async extractLinks(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -4293,7 +4538,7 @@ ${noteLinks}
       const stopWords = new Set(['that', 'this', 'with', 'from', 'have', 'been', 'were', 'will', 'your', 'there', 'their', 'what', 'when', 'where', 'which', 'while', 'would', 'could', 'should']);
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '');
         const words = bodyContent.toLowerCase().match(/\b[a-z]+\b/g) || [];
@@ -4332,7 +4577,7 @@ ${noteLinks}
 
   async extractCodeBlocks(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -4382,7 +4627,7 @@ ${noteLinks}
       const timeline = {};
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -4433,7 +4678,7 @@ ${noteLinks}
 
   async noteComplexity(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -4572,18 +4817,20 @@ ${noteLinks}
     const { source_path, destination_folder = '' } = args;
 
     try {
-      const destPath = destination_folder 
-        ? path.join(OBSIDIAN_VAULT_PATH, destination_folder)
+      // C-03 fix: source_path must be inside the vault — no arbitrary filesystem reads.
+      const resolvedSource = safeVaultPath(OBSIDIAN_VAULT_PATH, source_path);
+      const destPath = destination_folder
+        ? safeVaultPath(OBSIDIAN_VAULT_PATH, destination_folder)
         : OBSIDIAN_VAULT_PATH;
 
       await fs.mkdir(destPath, { recursive: true });
 
-      const files = await fs.readdir(source_path);
+      const files = await fs.readdir(resolvedSource);
       const mdFiles = files.filter(f => f.endsWith('.md'));
       let imported = 0;
 
       for (const file of mdFiles) {
-        const sourcePath = path.join(source_path, file);
+        const sourcePath = path.join(resolvedSource, file);
         const targetPath = path.join(destPath, file);
         await fs.copyFile(sourcePath, targetPath);
         imported++;
@@ -4592,10 +4839,11 @@ ${noteLinks}
       return {
         content: [{
           type: "text",
-          text: `Imported ${imported} markdown files from ${source_path}`,
+          text: `Imported ${imported} markdown files from ${resolvedSource}`,
         }],
       };
     } catch (error) {
+      await this.audit.log('importMarkdownFolder', args, error.message);
       return {
         content: [{
           type: "text",
@@ -4622,7 +4870,7 @@ ${noteLinks}
     const { output_path } = args || {};
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const archiveName = `vault-export-${timestamp}.tar`;
-    const archivePath = output_path || path.join(__dirname, archiveName);
+    const archivePath = await safeOutputPath(output_path, archiveName);
 
     try {
       return {
@@ -4644,24 +4892,40 @@ ${noteLinks}
   }
 
   async mergeNotes(args) {
-    const { filenames, output_filename, delete_originals = false } = args;
-    const outputPath = path.join(OBSIDIAN_VAULT_PATH, output_filename.endsWith('.md') ? output_filename : `${output_filename}.md`);
+    const { filenames, output_filename, delete_originals = false, dry_run = false } = args;
+
+    if (!filenames || filenames.length < 2) {
+      throw new Error('mergeNotes requires at least 2 filenames');
+    }
+    if (filenames.length > BATCH_LIMIT) {
+      throw new Error(`mergeNotes: batch size ${filenames.length} exceeds limit ${BATCH_LIMIT}. Increase OBSIDIAN_BATCH_LIMIT env var if needed.`);
+    }
+
+    if (dry_run) {
+      return {
+        content: [{
+          type: "text",
+          text: `[DRY RUN] Would merge ${filenames.length} notes into "${output_filename}"${delete_originals ? ' and delete originals' : ''}.\nFiles: ${filenames.join(', ')}`,
+        }],
+      };
+    }
+
+    const outputPath = safeVaultPath(OBSIDIAN_VAULT_PATH, output_filename.endsWith('.md') ? output_filename : `${output_filename}.md`);
 
     try {
-      let mergedContent = `---
-title: ${output_filename.replace('.md', '')}
-type: merged-note
-created: ${new Date().toISOString()}
-tags: ["merged"]
-merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
----
-
+      let mergedContent = buildFrontmatter({
+        title: output_filename.replace('.md', ''),
+        type: "merged-note",
+        created: new Date().toISOString(),
+        tags: ["merged"],
+        merged_from: filenames,
+      }) + `
 # ${output_filename.replace('.md', '')}
 
 `;
 
       for (const filename of filenames) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
         const content = await fs.readFile(filepath, "utf-8");
         const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '');
         
@@ -4673,17 +4937,22 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
       if (delete_originals) {
         for (const filename of filenames) {
-          await fs.unlink(path.join(OBSIDIAN_VAULT_PATH, filename));
+          await moveToTrash(safeVaultPath(OBSIDIAN_VAULT_PATH, filename));
         }
       }
 
+      const deleteLabel = delete_originals
+        ? (process.env.OBSIDIAN_HARD_DELETE === 'true' ? ' (originals deleted)' : ' (originals moved to trash)')
+        : '';
+      await this.audit.log('mergeNotes', args, 'ok');
       return {
         content: [{
           type: "text",
-          text: `Merged ${filenames.length} notes into ${output_filename}${delete_originals ? ' (originals deleted)' : ''}`,
+          text: `Merged ${filenames.length} notes into ${output_filename}${deleteLabel}`,
         }],
       };
     } catch (error) {
+      await this.audit.log('mergeNotes', args, error.message);
       return {
         content: [{
           type: "text",
@@ -4696,9 +4965,9 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async duplicateNote(args) {
     const { filename, new_filename } = args;
-    const sourcePath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const sourcePath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
     const destFilename = new_filename.endsWith('.md') ? new_filename : `${new_filename}.md`;
-    const destPath = path.join(OBSIDIAN_VAULT_PATH, destFilename);
+    const destPath = safeVaultPath(OBSIDIAN_VAULT_PATH, destFilename);
 
     try {
       await fs.copyFile(sourcePath, destPath);
@@ -4722,8 +4991,8 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async archiveNote(args) {
     const { filename } = args;
-    const sourcePath = path.join(OBSIDIAN_VAULT_PATH, filename);
-    const archiveDir = path.join(OBSIDIAN_VAULT_PATH, 'Archive');
+    const sourcePath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
+    const archiveDir = safeVaultPath(OBSIDIAN_VAULT_PATH, 'Archive');
     const destPath = path.join(archiveDir, filename);
 
     try {
@@ -4748,218 +5017,37 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
   }
 
   async exportNotePdf(args) {
-    const { filename, output_path } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
-
-    try {
-      const content = await fs.readFile(filepath, "utf-8");
-      const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '');
-      const html = await marked(bodyContent);
-
-      const styledHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <style>
-        @page { margin: 2cm; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 800px;
-            margin: 0 auto;
-        }
-        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 0.3em; }
-        h2 { color: #34495e; border-bottom: 1px solid #bdc3c7; padding-bottom: 0.2em; margin-top: 1.5em; }
-        h3 { color: #7f8c8d; margin-top: 1.2em; }
-        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; }
-        pre { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; overflow-x: auto; }
-        pre code { background: none; color: #ecf0f1; }
-        a { color: #3498db; text-decoration: none; }
-        blockquote { border-left: 4px solid #3498db; padding-left: 1em; color: #7f8c8d; margin: 1em 0; }
-        table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-        th { background: #3498db; color: white; }
-        img { max-width: 100%; height: auto; }
-    </style>
-</head>
-<body>
-    <h1>${filename.replace('.md', '')}</h1>
-    ${html}
-</body>
-</html>`;
-
-      const browser = await puppeteer.launch({ headless: "new" });
-      const page = await browser.newPage();
-      await page.setContent(styledHtml);
-      
-      const outputFile = output_path || filepath.replace('.md', '.pdf');
-      await page.pdf({
-        path: outputFile,
-        format: 'A4',
-        printBackground: true,
-        margin: { top: '2cm', right: '2cm', bottom: '2cm', left: '2cm' },
-      });
-
-      await browser.close();
-
-      return {
-        content: [{
-          type: "text",
-          text: `Exported to PDF: ${outputFile}`,
-        }],
-      };
-    } catch (error) {
-      return {
-        content: [{
-          type: "text",
-          text: `Error exporting to PDF: ${error.message}`,
-        }],
-        isError: true,
-      };
-    }
+    // SECURITY: Disabled — H-01
+    // Puppeteer/Chromium launches without CSP or network restrictions, and injects
+    // unsanitized HTML from note content, enabling SSRF and data exfiltration via
+    // crafted notes. Use export_note_html and convert locally instead.
+    return {
+      content: [{
+        type: "text",
+        text: "export_note_pdf is disabled for security reasons. Puppeteer-based PDF export allows potential HTML injection and network exfiltration from note content. Use export_note_html instead and convert to PDF locally.",
+      }],
+      isError: true,
+    };
+  }
   }
 
   async exportVaultPdf(args) {
-    const { output_path, include_toc = true, organize_by = 'folder' } = args || {};
-    
-    try {
-      const files = await fs.readdir(OBSIDIAN_VAULT_PATH);
-      const mdFiles = files.filter((f) => f.endsWith(".md"));
-      
-      const notes = [];
-      for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
-        const content = await fs.readFile(filepath, "utf-8");
-        const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
-        
-        let title = file.replace('.md', '');
-        let tags = [];
-        let type = 'note';
-        
-        if (frontmatterMatch) {
-          const titleMatch = frontmatterMatch[1].match(/title:\s*(.+)/);
-          const tagsMatch = frontmatterMatch[1].match(/tags:\s*\[(.*?)\]/);
-          const typeMatch = frontmatterMatch[1].match(/type:\s*(.+)/);
-          
-          if (titleMatch) title = titleMatch[1];
-          if (tagsMatch) tags = tagsMatch[1].split(",").map((t) => t.trim().replace(/"/g, ""));
-          if (typeMatch) type = typeMatch[1].trim();
-        }
-        
-        const body = content.replace(/^---\n[\s\S]*?\n---\n/, '');
-        notes.push({ filename: file, title, tags, type, content: body });
-      }
-
-      let tocHtml = '';
-      let contentHtml = '';
-      let pageNum = 1;
-
-      if (include_toc) {
-        tocHtml = '<div style="page-break-after: always;"><h1>Table of Contents</h1><ul style="list-style: none; padding: 0;">';
-        notes.forEach((note, idx) => {
-          tocHtml += `<li style="margin: 0.5em 0;"><a href="#note-${idx}" style="color: #3498db;">${note.title}</a></li>`;
-        });
-        tocHtml += '</ul></div>';
-      }
-
-      for (let i = 0; i < notes.length; i++) {
-        const note = notes[i];
-        const html = await marked(note.content);
-        contentHtml += `
-<div style="page-break-before: always;" id="note-${i}">
-    <h1 style="color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 0.3em;">${note.title}</h1>
-    <p style="color: #7f8c8d; font-size: 0.9em;">Type: ${note.type} | Tags: ${note.tags.join(', ') || 'none'}</p>
-    ${html}
-</div>`;
-      }
-
-      const fullHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Vault Export - ${path.basename(OBSIDIAN_VAULT_PATH)}</title>
-    <style>
-        @page { 
-            margin: 2.5cm;
-            @top-right { content: counter(page); }
-        }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
-        }
-        h1 { color: #2c3e50; margin-top: 0; }
-        h2 { color: #34495e; border-bottom: 1px solid #bdc3c7; padding-bottom: 0.2em; margin-top: 1.5em; }
-        h3 { color: #7f8c8d; margin-top: 1.2em; }
-        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; font-size: 0.9em; }
-        pre { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; overflow-x: auto; margin: 1em 0; }
-        pre code { background: none; color: #ecf0f1; }
-        a { color: #3498db; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        blockquote { border-left: 4px solid #3498db; padding-left: 1em; color: #7f8c8d; margin: 1em 0; font-style: italic; }
-        table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-        th { background: #3498db; color: white; font-weight: 600; }
-        tr:nth-child(even) { background: #f9f9f9; }
-        img { max-width: 100%; height: auto; display: block; margin: 1em auto; }
-        ul, ol { margin: 0.5em 0; }
-        li { margin: 0.3em 0; }
-    </style>
-</head>
-<body>
-    <div style="text-align: center; padding: 4cm 0;">
-        <h1 style="font-size: 3em; margin-bottom: 0.2em;">📚 ${path.basename(OBSIDIAN_VAULT_PATH)}</h1>
-        <p style="font-size: 1.2em; color: #7f8c8d;">Complete Vault Export</p>
-        <p style="color: #95a5a6;">${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}</p>
-        <p style="color: #95a5a6;">${notes.length} notes</p>
-    </div>
-    ${tocHtml}
-    ${contentHtml}
-</body>
-</html>`;
-
-      const browser = await puppeteer.launch({ headless: "new" });
-      const page = await browser.newPage();
-      await page.setContent(fullHtml, { waitUntil: 'networkidle0' });
-      
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const outputFile = output_path || path.join(__dirname, `vault-export-${timestamp}.pdf`);
-      
-      await page.pdf({
-        path: outputFile,
-        format: 'A4',
-        printBackground: true,
-        displayHeaderFooter: true,
-        headerTemplate: '<div></div>',
-        footerTemplate: '<div style="font-size: 10px; text-align: center; width: 100%;"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
-        margin: { top: '2.5cm', right: '2.5cm', bottom: '2.5cm', left: '2.5cm' },
-      });
-
-      await browser.close();
-
-      return {
-        content: [{
-          type: "text",
-          text: `Exported ${notes.length} notes to PDF: ${outputFile}`,
-        }],
-      };
-    } catch (error) {
-      return {
-        content: [{
-          type: "text",
-          text: `Error exporting vault to PDF: ${error.message}`,
-        }],
-        isError: true,
-      };
-    }
+    // SECURITY: Disabled — H-01
+    // Puppeteer/Chromium launches without CSP or network restrictions and processes
+    // unsanitized HTML from all vault notes, amplifying SSRF and exfiltration risk
+    // across the entire vault. Use export_vault_markdown_bundle or export_vault_json instead.
+    return {
+      content: [{
+        type: "text",
+        text: "export_vault_pdf is disabled for security reasons. Use export_vault_markdown_bundle or export_vault_json instead.",
+      }],
+      isError: true,
+    };
   }
 
   async exportNoteMarkdown(args) {
     const { filename, output_path, resolve_links = false } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let content = await fs.readFile(filepath, "utf-8");
@@ -4969,7 +5057,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
         for (const link of links) {
           const linkName = link.slice(2, -2).split('|')[0];
           const linkedFile = `${linkName}.md`;
-          const linkedPath = path.join(OBSIDIAN_VAULT_PATH, linkedFile);
+          const linkedPath = safeVaultPath(OBSIDIAN_VAULT_PATH, linkedFile);
           
           try {
             const linkedContent = await fs.readFile(linkedPath, "utf-8");
@@ -4980,7 +5068,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
         }
       }
 
-      const outputFile = output_path || filepath.replace('.md', '-export.md');
+      const outputFile = await safeOutputPath(output_path, 'note-export.md');
       await fs.writeFile(outputFile, content, "utf-8");
 
       return {
@@ -5014,7 +5102,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       };
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -5044,8 +5132,9 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       }
 
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const outputFile = output_path || path.join(__dirname, `vault-export-${timestamp}.json`);
+      const outputFile = await safeOutputPath(output_path, `vault-export-${Date.now()}.json`);
       await fs.writeFile(outputFile, JSON.stringify(vault, null, 2), "utf-8");
+      await this.audit.log('exportVaultJson', args, 'ok');
 
       return {
         content: [{
@@ -5054,6 +5143,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
         }],
       };
     } catch (error) {
+      await this.audit.log('exportVaultJson', args, error.message);
       return {
         content: [{
           type: "text",
@@ -5073,7 +5163,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const rows = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const stats = await fs.stat(filepath);
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
@@ -5104,8 +5194,9 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
       const csv = parse(rows);
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const outputFile = output_path || path.join(__dirname, `vault-index-${timestamp}.csv`);
+      const outputFile = await safeOutputPath(output_path, `vault-index-${Date.now()}.csv`);
       await fs.writeFile(outputFile, csv, "utf-8");
+      await this.audit.log('exportVaultCsv', args, 'ok');
 
       return {
         content: [{
@@ -5114,6 +5205,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
         }],
       };
     } catch (error) {
+      await this.audit.log('exportVaultCsv', args, error.message);
       return {
         content: [{
           type: "text",
@@ -5126,7 +5218,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async exportNotePlaintext(args) {
     const { filename, output_path } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -5142,7 +5234,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
         .replace(/^[-*]\s+/gm, '• ')
         .trim();
 
-      const outputFile = output_path || filepath.replace('.md', '.txt');
+      const outputFile = await safeOutputPath(output_path, 'note-export.txt');
       await fs.writeFile(outputFile, plaintext, "utf-8");
 
       return {
@@ -5167,7 +5259,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
     try {
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const exportDir = output_path || path.join(__dirname, `vault-bundle-${timestamp}`);
+      const exportDir = await safeOutputPath(output_path, `vault-bundle-${Date.now()}.zip`);
       
       await fs.mkdir(exportDir, { recursive: true });
 
@@ -5193,6 +5285,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
       const files = await fs.readdir(exportDir);
       const mdCount = files.filter(f => f.endsWith('.md')).length;
+      await this.audit.log('exportVaultMarkdownBundle', args, 'ok');
 
       return {
         content: [{
@@ -5201,6 +5294,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
         }],
       };
     } catch (error) {
+      await this.audit.log('exportVaultMarkdownBundle', args, error.message);
       return {
         content: [{
           type: "text",
@@ -5215,7 +5309,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
   
   async createCanvas(args) {
     const { name } = args;
-    const canvasPath = path.join(OBSIDIAN_VAULT_PATH, `${name}.canvas`);
+    const canvasPath = safeVaultPath(OBSIDIAN_VAULT_PATH, `${name}.canvas`);
 
     try {
       const canvasData = {
@@ -5244,7 +5338,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async addCardToCanvas(args) {
     const { canvas_name, card_type, content, x = 0, y = 0, width = 400, height = 200 } = args;
-    const canvasPath = path.join(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
+    const canvasPath = safeVaultPath(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
 
     try {
       const canvasData = JSON.parse(await fs.readFile(canvasPath, 'utf-8'));
@@ -5285,7 +5379,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async addConnectionToCanvas(args) {
     const { canvas_name, from_id, to_id } = args;
-    const canvasPath = path.join(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
+    const canvasPath = safeVaultPath(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
 
     try {
       const canvasData = JSON.parse(await fs.readFile(canvasPath, 'utf-8'));
@@ -5319,7 +5413,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async createCanvasGroup(args) {
     const { canvas_name, label, card_ids } = args;
-    const canvasPath = path.join(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
+    const canvasPath = safeVaultPath(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
 
     try {
       const canvasData = JSON.parse(await fs.readFile(canvasPath, 'utf-8'));
@@ -5369,7 +5463,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async readCanvas(args) {
     const { canvas_name } = args;
-    const canvasPath = path.join(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
+    const canvasPath = safeVaultPath(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
 
     try {
       const canvasData = JSON.parse(await fs.readFile(canvasPath, 'utf-8'));
@@ -5393,7 +5487,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async updateCanvasCard(args) {
     const { canvas_name, card_id, updates } = args;
-    const canvasPath = path.join(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
+    const canvasPath = safeVaultPath(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
 
     try {
       const canvasData = JSON.parse(await fs.readFile(canvasPath, 'utf-8'));
@@ -5426,66 +5520,71 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
   // ===== DATAVIEW QUERY EXECUTION METHODS =====
 
   async executeDataviewQuery(args) {
-    const { query } = args;
-
     try {
-      // Simple implementation: parse basic LIST/TABLE queries
-      const files = await fs.readdir(OBSIDIAN_VAULT_PATH);
-      const mdFiles = files.filter(f => f.endsWith('.md'));
-      const notes = [];
-
-      for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
-        const content = await fs.readFile(filepath, 'utf-8');
-        const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
-        
-        if (frontmatterMatch) {
-          const metadata = {};
-          const lines = frontmatterMatch[1].split('\n');
-          lines.forEach(line => {
-            const match = line.match(/^(\w+):\s*(.+)$/);
-            if (match) {
-              metadata[match[1]] = match[2];
-            }
-          });
-          notes.push({ file, ...metadata });
-        }
-      }
-
-      // Basic query execution (simplified)
-      let results = notes;
-      if (query.includes('WHERE')) {
-        const whereMatch = query.match(/WHERE\s+(.+)/i);
-        if (whereMatch) {
-          // Simple tag filter
-          const tagMatch = whereMatch[1].match(/#(\w+)/);
-          if (tagMatch) {
-            const tag = tagMatch[1];
-            results = results.filter(n => n.tags && n.tags.includes(tag));
-          }
-        }
-      }
-
-      return {
-        content: [{
-          type: "text",
-          text: `Query Results (${results.length} items):\n\n${JSON.stringify(results, null, 2)}\n\nNote: This is a simplified Dataview implementation. For full DQL support, use Obsidian with Dataview plugin.`,
-        }],
-      };
+      return await withTimeout(
+        this._executeDataviewQueryInternal(args),
+        QUERY_TIMEOUT_MS,
+        'executeDataviewQuery'
+      );
     } catch (error) {
       return {
-        content: [{
-          type: "text",
-          text: `Error executing dataview query: ${error.message}`,
-        }],
+        content: [{ type: "text", text: `executeDataviewQuery: ${error.message}` }],
         isError: true,
       };
     }
   }
 
+  async _executeDataviewQueryInternal(args) {
+    const { query } = args;
+
+    // Simple implementation: parse basic LIST/TABLE queries
+    const files = await fs.readdir(OBSIDIAN_VAULT_PATH);
+    const mdFiles = files.filter(f => f.endsWith('.md'));
+    const notes = [];
+
+    for (const file of mdFiles) {
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
+      const content = await fs.readFile(filepath, 'utf-8');
+      const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+      
+      if (frontmatterMatch) {
+        const metadata = {};
+        const lines = frontmatterMatch[1].split('\n');
+        lines.forEach(line => {
+          const match = line.match(/^(\w+):\s*(.+)$/);
+          if (match) {
+            metadata[match[1]] = match[2];
+          }
+        });
+        notes.push({ file, ...metadata });
+      }
+    }
+
+    // Basic query execution (simplified)
+    let results = notes;
+    if (query.includes('WHERE')) {
+      const whereMatch = query.match(/WHERE\s+(.+)/i);
+      if (whereMatch) {
+        // Simple tag filter
+        const tagMatch = whereMatch[1].match(/#(\w+)/);
+        if (tagMatch) {
+          const tag = tagMatch[1];
+          results = results.filter(n => n.tags && n.tags.includes(tag));
+        }
+      }
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: `Query Results (${results.length} items):\n\n${JSON.stringify(results, null, 2)}\n\nNote: This is a simplified Dataview implementation. For full DQL support, use Obsidian with Dataview plugin.`,
+      }],
+    };
+  }
+
   async createDataviewCodeblock(args) {
     const { filename, query } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let content = await fs.readFile(filepath, 'utf-8');
@@ -5557,7 +5656,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const edges = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         
         nodes.push({ id: file, label: file.replace('.md', '') });
@@ -5612,7 +5711,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       }
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const links = content.match(/\[\[([^\]]+)\]\]/g) || [];
         
@@ -5683,7 +5782,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       }
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const links = content.match(/\[\[([^\]]+)\]\]/g) || [];
         
@@ -5736,7 +5835,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       }
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const links = content.match(/\[\[([^\]]+)\]\]/g) || [];
         
@@ -5803,7 +5902,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       }
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         
         // Count outbound links
@@ -5950,7 +6049,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
     const { file_types } = args || {};
 
     try {
-      const attachDir = path.join(OBSIDIAN_VAULT_PATH, 'attachments');
+      const attachDir = safeVaultPath(OBSIDIAN_VAULT_PATH, 'attachments');
       let files = [];
 
       try {
@@ -6000,13 +6099,17 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
     const { source_path, dest_name } = args;
 
     try {
-      const attachDir = path.join(OBSIDIAN_VAULT_PATH, 'attachments');
+      // C-04 fix: source_path must be inside the vault — prevents exfiltrating
+      // arbitrary system files into the vault's attachments directory.
+      const resolvedSource = safeVaultPath(OBSIDIAN_VAULT_PATH, source_path);
+      const attachDir = safeVaultPath(OBSIDIAN_VAULT_PATH, 'attachments');
       await fs.mkdir(attachDir, { recursive: true });
 
-      const filename = dest_name || path.basename(source_path);
+      const filename = dest_name || path.basename(resolvedSource);
       const destPath = path.join(attachDir, filename);
 
-      await fs.copyFile(source_path, destPath);
+      await fs.copyFile(resolvedSource, destPath);
+      await this.audit.log('attachFile', args, 'ok');
 
       return {
         content: [{
@@ -6015,6 +6118,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
         }],
       };
     } catch (error) {
+      await this.audit.log('attachFile', args, error.message);
       return {
         content: [{
           type: "text",
@@ -6029,7 +6133,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
     const { filename } = args;
 
     try {
-      const attachPath = path.join(OBSIDIAN_VAULT_PATH, 'attachments', filename);
+      const attachPath = safeVaultPath(OBSIDIAN_VAULT_PATH, 'attachments', filename);
       await fs.unlink(attachPath);
 
       return {
@@ -6051,7 +6155,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async findOrphanedAttachments(args) {
     try {
-      const attachDir = path.join(OBSIDIAN_VAULT_PATH, 'attachments');
+      const attachDir = safeVaultPath(OBSIDIAN_VAULT_PATH, 'attachments');
       let attachments = [];
 
       try {
@@ -6071,7 +6175,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       let allContent = '';
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         allContent += content;
       }
@@ -6104,7 +6208,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const references = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         
         if (content.includes(filename)) {
@@ -6132,15 +6236,52 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
   // ===== ADVANCED SEARCH & REPLACE METHODS =====
 
   async regexSearchAndReplace(args) {
-    const { pattern, replacement, filenames } = args;
+    const { pattern, replacement, scope, dry_run = false } = args;
+
+    if (!scope || (Array.isArray(scope) && scope.length === 0)) {
+      throw new Error('regexSearchAndReplace requires an explicit "scope" (list of files or folder name). To operate on the full vault, pass scope: ["all"] explicitly.');
+    }
 
     try {
-      const files = filenames || (await fs.readdir(OBSIDIAN_VAULT_PATH)).filter(f => f.endsWith('.md'));
-      const regex = new RegExp(pattern, 'g');
+      let files;
+      if (Array.isArray(scope) && scope.length === 1 && scope[0] === 'all') {
+        files = (await fs.readdir(OBSIDIAN_VAULT_PATH)).filter(f => f.endsWith('.md'));
+      } else {
+        files = Array.isArray(scope) ? scope : [scope];
+      }
+
+      if (files.length > REPLACE_LIMIT) {
+        throw new Error(`regexSearchAndReplace: scope contains ${files.length} files, which exceeds limit ${REPLACE_LIMIT}. Increase OBSIDIAN_REPLACE_LIMIT env var if needed.`);
+      }
+
+      const regex = compileUserRegex(pattern, 'g');
+
+      if (dry_run) {
+        const preview = [];
+        for (const file of files) {
+          const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
+          try {
+            const fileContent = await fs.readFile(filepath, 'utf-8');
+            const matches = (fileContent.match(regex) || []).length;
+            if (matches > 0) {
+              preview.push(`  ${file}: ${matches} match(es)`);
+            }
+          } catch (e) {
+            // Skip files that can't be read
+          }
+        }
+        return {
+          content: [{
+            type: "text",
+            text: `[DRY RUN] Would replace pattern /${pattern}/ with "${replacement}" across ${files.length} file(s).\nFiles with matches:\n${preview.length > 0 ? preview.join('\n') : '  (none)'}`,
+          }],
+        };
+      }
+
       let totalReplacements = 0;
 
       for (const file of files) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         try {
           let content = await fs.readFile(filepath, 'utf-8');
           const matches = (content.match(regex) || []).length;
@@ -6155,6 +6296,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
         }
       }
 
+      await this.audit.log('regexSearchAndReplace', args, 'ok');
       return {
         content: [{
           type: "text",
@@ -6162,6 +6304,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
         }],
       };
     } catch (error) {
+      await this.audit.log('regexSearchAndReplace', args, error.message);
       return {
         content: [{
           type: "text",
@@ -6181,7 +6324,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const results = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -6219,7 +6362,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const results = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         let links = [];
 
@@ -6260,7 +6403,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       let replacements = 0;
 
       for (const file of filenames) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         try {
           let content = await fs.readFile(filepath, 'utf-8');
           const occurrences = (content.match(new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
@@ -6296,29 +6439,22 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async updateFrontmatterField(args) {
     const { filename, field, value } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let content = await fs.readFile(filepath, 'utf-8');
       const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
 
       if (!fmMatch) {
-        // Add frontmatter if it doesn't exist
-        const newFm = `---\n${field}: ${JSON.stringify(value)}\n---\n\n`;
+        // Add frontmatter if it doesn't exist — use js-yaml to serialize safely
+        const newFm = buildFrontmatter({ [field]: value }) + "\n";
         content = newFm + content;
       } else {
-        const fm = fmMatch[1];
-        const fieldRegex = new RegExp(`^${field}:.*$`, 'm');
-        
-        if (fieldRegex.test(fm)) {
-          // Update existing field
-          const newFm = fm.replace(fieldRegex, `${field}: ${JSON.stringify(value)}`);
-          content = content.replace(fmMatch[0], `---\n${newFm}\n---`);
-        } else {
-          // Add new field
-          const newFm = `${fm}\n${field}: ${JSON.stringify(value)}`;
-          content = content.replace(fmMatch[0], `---\n${newFm}\n---`);
-        }
+        // Parse the existing frontmatter, update the field, and re-serialize
+        const parsedFm = yaml.load(fmMatch[1]) || {};
+        parsedFm[field] = value;
+        const serialized = `---\n${yaml.dump(parsedFm, { lineWidth: -1 })}---`;
+        content = content.replace(fmMatch[0], serialized);
       }
 
       await fs.writeFile(filepath, content, 'utf-8');
@@ -6367,7 +6503,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async validateFrontmatterSchema(args) {
     const { filename, schema } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, 'utf-8');
@@ -6432,7 +6568,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const properties = new Set();
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -6472,16 +6608,17 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       let updated = 0;
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         let content = await fs.readFile(filepath, 'utf-8');
         const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
         if (fmMatch) {
-          const oldFm = fmMatch[1];
-          const newFm = oldFm.replace(new RegExp(`^${old_name}:`, 'm'), `${new_name}:`);
-          
-          if (oldFm !== newFm) {
-            content = content.replace(fmMatch[0], `---\n${newFm}\n---`);
+          const parsedFm = yaml.load(fmMatch[1]) || {};
+          if (Object.prototype.hasOwnProperty.call(parsedFm, old_name)) {
+            parsedFm[new_name] = parsedFm[old_name];
+            delete parsedFm[old_name];
+            const serialized = `---\n${yaml.dump(parsedFm, { lineWidth: -1 })}---`;
+            content = content.replace(fmMatch[0], serialized);
             await fs.writeFile(filepath, content, 'utf-8');
             updated++;
           }
@@ -6514,7 +6651,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const values = new Map();
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -6552,7 +6689,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
     const { template_name, filename, variables = {} } = args;
     
     try {
-      const templatePath = path.join(OBSIDIAN_VAULT_PATH, 'Templates', `${template_name}.md`);
+      const templatePath = safeVaultPath(OBSIDIAN_VAULT_PATH, 'Templates', `${template_name}.md`);
       let template = await fs.readFile(templatePath, 'utf-8');
 
       // Replace variables
@@ -6564,7 +6701,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       template = template.replace(/{{date}}/g, new Date().toISOString().split('T')[0]);
       template = template.replace(/{{datetime}}/g, new Date().toISOString());
 
-      const outputPath = path.join(OBSIDIAN_VAULT_PATH, filename.endsWith('.md') ? filename : `${filename}.md`);
+      const outputPath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename.endsWith('.md') ? filename : `${filename}.md`);
       await fs.writeFile(outputPath, template, 'utf-8');
 
       return {
@@ -6588,17 +6725,15 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
     const { title, author, genre = '' } = args;
     const filename = this.sanitizeFilename(`book-${title}`);
 
-    const content = `---
-title: ${title}
-type: book-note
-author: ${author}
-genre: ${genre}
-status: reading
-rating: 
-created: ${new Date().toISOString()}
-tags: ["books", "literature"]
----
-
+    const content = buildFrontmatter({
+      title,
+      type: "book-note",
+      author,
+      genre: genre || undefined,
+      status: "reading",
+      created: new Date().toISOString(),
+      tags: ["books", "literature"],
+    }) + `
 # ${title}
 
 **Author:** ${author}
@@ -6620,7 +6755,7 @@ tags: ["books", "literature"]
 `;
 
     try {
-      const filepath = path.join(OBSIDIAN_VAULT_PATH, `${filename}.md`);
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, `${filename}.md`);
       await fs.writeFile(filepath, content, 'utf-8');
 
       return {
@@ -6644,14 +6779,13 @@ tags: ["books", "literature"]
     const { name, relation = '' } = args;
     const filename = this.sanitizeFilename(`person-${name}`);
 
-    const content = `---
-title: ${name}
-type: person-note
-relation: ${relation}
-created: ${new Date().toISOString()}
-tags: ["people", "contacts"]
----
-
+    const content = buildFrontmatter({
+      title: name,
+      type: "person-note",
+      relation: relation || undefined,
+      created: new Date().toISOString(),
+      tags: ["people", "contacts"],
+    }) + `
 # ${name}
 
 **Relation:** ${relation}
@@ -6672,7 +6806,7 @@ tags: ["people", "contacts"]
 `;
 
     try {
-      const filepath = path.join(OBSIDIAN_VAULT_PATH, `${filename}.md`);
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, `${filename}.md`);
       await fs.writeFile(filepath, content, 'utf-8');
 
       return {
@@ -6696,15 +6830,14 @@ tags: ["people", "contacts"]
     const { title, date = new Date().toISOString().split('T')[0], attendees = [] } = args;
     const filename = this.sanitizeFilename(`meeting-${date}-${title}`);
 
-    const content = `---
-title: ${title}
-type: meeting-note
-date: ${date}
-attendees: [${attendees.map(a => `"${a}"`).join(', ')}]
-created: ${new Date().toISOString()}
-tags: ["meetings"]
----
-
+    const content = buildFrontmatter({
+      title,
+      type: "meeting-note",
+      date,
+      attendees,
+      created: new Date().toISOString(),
+      tags: ["meetings"],
+    }) + `
 # ${title}
 
 **Date:** ${date}
@@ -6728,7 +6861,7 @@ tags: ["meetings"]
 `;
 
     try {
-      const filepath = path.join(OBSIDIAN_VAULT_PATH, `${filename}.md`);
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, `${filename}.md`);
       await fs.writeFile(filepath, content, 'utf-8');
 
       return {
@@ -6752,15 +6885,15 @@ tags: ["meetings"]
     const { name, goal = '', deadline = '' } = args;
     const filename = this.sanitizeFilename(`project-${name}`);
 
-    const content = `---
-title: ${name}
-type: project-note
-goal: ${goal}
-deadline: ${deadline}
-status: planning
-created: ${new Date().toISOString()}
-tags: ["projects"]
----
+    const content = buildFrontmatter({
+      title: name,
+      type: "project-note",
+      goal: goal || undefined,
+      deadline: deadline || undefined,
+      status: "planning",
+      created: new Date().toISOString(),
+      tags: ["projects"],
+    }) +
 
 # ${name}
 
@@ -6795,7 +6928,7 @@ tags: ["projects"]
 `;
 
     try {
-      const filepath = path.join(OBSIDIAN_VAULT_PATH, `${filename}.md`);
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, `${filename}.md`);
       await fs.writeFile(filepath, content, 'utf-8');
 
       return {
@@ -6826,7 +6959,7 @@ tags: ["projects"]
       const tasks = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const lines = content.split('\n');
         
@@ -6871,8 +7004,8 @@ tags: ["projects"]
     const { source_file, dest_file, task_text } = args;
 
     try {
-      const sourcePath = path.join(OBSIDIAN_VAULT_PATH, source_file);
-      const destPath = path.join(OBSIDIAN_VAULT_PATH, dest_file);
+      const sourcePath = safeVaultPath(OBSIDIAN_VAULT_PATH, source_file);
+      const destPath = safeVaultPath(OBSIDIAN_VAULT_PATH, dest_file);
 
       let sourceContent = await fs.readFile(sourcePath, 'utf-8');
       let destContent = await fs.readFile(destPath, 'utf-8');
@@ -6912,7 +7045,7 @@ tags: ["projects"]
 
   async addTaskMetadata(args) {
     const { filename, task_text, metadata } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let content = await fs.readFile(filepath, 'utf-8');
@@ -6962,7 +7095,7 @@ tags: ["projects"]
       const tasks = { pending: [], completed: [] };
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const lines = content.split('\n');
         
@@ -6978,12 +7111,12 @@ tags: ["projects"]
         });
       }
 
-      const reportContent = `---
-title: Task Report
-type: task-report
-created: ${new Date().toISOString()}
-tags: ["tasks", "reports"]
----
+      const reportContent = buildFrontmatter({
+        title: "Task Report",
+        type: "task-report",
+        created: new Date().toISOString(),
+        tags: ["tasks", "reports"],
+      }) +
 
 # Task Report
 
@@ -7001,7 +7134,7 @@ ${tasks.pending.map(t => `- [ ] ${t.text} (${t.file})`).join('\n') || '(none)'}
 ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x] ${t.text} (${t.file})`).join('\n') || '(none)'}` : ''}
 `;
 
-      const reportPath = path.join(OBSIDIAN_VAULT_PATH, output_filename);
+      const reportPath = safeVaultPath(OBSIDIAN_VAULT_PATH, output_filename);
       await fs.writeFile(reportPath, reportContent, 'utf-8');
 
       return {
@@ -7028,7 +7161,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       const blockedTasks = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const lines = content.split('\n');
         
@@ -7060,7 +7193,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
 
   async convertToCallout(args) {
     const { filename, text, callout_type = 'note' } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let content = await fs.readFile(filepath, 'utf-8');
@@ -7115,7 +7248,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
 
   async addTableOfContents(args) {
     const { filename, max_depth = 3 } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, 'utf-8');
@@ -7212,7 +7345,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
 
   async standardizeFormatting(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let content = await fs.readFile(filepath, 'utf-8');
@@ -7263,7 +7396,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       const notes = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '');
         notes.push({ file, content: bodyContent.toLowerCase().trim() });
@@ -7315,7 +7448,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       const emptyNotes = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '').trim();
         
@@ -7350,7 +7483,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       const largeNotes = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const stats = await fs.stat(filepath);
         const sizeKb = stats.size / 1024;
         
@@ -7390,7 +7523,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       let emptyNotes = 0;
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         
         // Word count
@@ -7458,7 +7591,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       let fixedCount = 0;
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         let content = await fs.readFile(filepath, 'utf-8');
         let modified = false;
         
@@ -7505,8 +7638,8 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
     const { file1, file2 } = args;
 
     try {
-      const path1 = path.join(OBSIDIAN_VAULT_PATH, file1);
-      const path2 = path.join(OBSIDIAN_VAULT_PATH, file2);
+      const path1 = safeVaultPath(OBSIDIAN_VAULT_PATH, file1);
+      const path2 = safeVaultPath(OBSIDIAN_VAULT_PATH, file2);
 
       const content1 = await fs.readFile(path1, 'utf-8');
       const content2 = await fs.readFile(path2, 'utf-8');
@@ -7554,7 +7687,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
 
   async findSimilarNotes(args) {
     const { filename, limit = 5 } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const targetContent = await fs.readFile(filepath, 'utf-8');
@@ -7565,7 +7698,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       const similarities = [];
 
       for (const file of mdFiles) {
-        const otherPath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const otherPath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const otherContent = await fs.readFile(otherPath, 'utf-8');
         const otherWords = new Set(otherContent.toLowerCase().replace(/^---\n[\s\S]*?\n---\n/, '').split(/\s+/));
         
@@ -7598,7 +7731,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
 
   async trackNoteChanges(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const stats = await fs.stat(filepath);
@@ -7642,7 +7775,7 @@ Note: For full version history, use a git repository or Obsidian Sync.
       const allContent = [];
 
       for (const file of filenames) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '');
         allContent.push({ file, content: bodyContent });
@@ -7667,19 +7800,20 @@ Note: For full version history, use a git repository or Obsidian Sync.
         mergedContent = allContent.map(c => c.content).join('\n\n');
       }
 
-      const frontmatter = `---
-title: ${output_filename.replace('.md', '')}
-type: merged-note
-merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
-created: ${new Date().toISOString()}
-tags: ["merged"]
----
+      const frontmatter = buildFrontmatter({
+        title: output_filename.replace('.md', ''),
+        type: "merged-note",
+        merged_from: filenames,
+        created: new Date().toISOString(),
+        tags: ["merged"],
+      }).trimEnd()
 
 `;
 
-      const outputPath = path.join(OBSIDIAN_VAULT_PATH, output_filename.endsWith('.md') ? output_filename : `${output_filename}.md`);
+      const outputPath = safeVaultPath(OBSIDIAN_VAULT_PATH, output_filename.endsWith('.md') ? output_filename : `${output_filename}.md`);
       await fs.writeFile(outputPath, frontmatter + mergedContent, 'utf-8');
 
+      await this.audit.log('mergeNotesEnhanced', args, 'ok');
       return {
         content: [{
           type: "text",
@@ -7687,6 +7821,7 @@ tags: ["merged"]
         }],
       };
     } catch (error) {
+      await this.audit.log('mergeNotesEnhanced', args, error.message);
       return {
         content: [{
           type: "text",
@@ -7699,7 +7834,7 @@ tags: ["merged"]
 
   async splitNoteByHeadings(args) {
     const { filename, heading_level = 2, output_folder } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, 'utf-8');
@@ -7726,7 +7861,7 @@ tags: ["merged"]
         sections.push(currentSection);
       }
 
-      const outputDir = output_folder ? path.join(OBSIDIAN_VAULT_PATH, output_folder) : path.join(OBSIDIAN_VAULT_PATH, filename.replace('.md', '-split'));
+      const outputDir = output_folder ? safeVaultPath(OBSIDIAN_VAULT_PATH, output_folder) : safeVaultPath(OBSIDIAN_VAULT_PATH, filename.replace('.md', '-split'));
       await fs.mkdir(outputDir, { recursive: true });
 
       for (const section of sections) {
@@ -7750,6 +7885,56 @@ tags: ["merged"]
         isError: true,
       };
     }
+  }
+
+  async listTrash(args) {
+    const trashDir = path.join(OBSIDIAN_VAULT_PATH, '.trash');
+    try {
+      const files = await fs.readdir(trashDir);
+      const items = files.map(f => {
+        const parts = f.match(/^(\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}Z)_(.+)$/);
+        return parts
+          ? { trash_id: f, original_name: parts[2], deleted_at: parts[1].replace(/-/g, (m, o) => o > 18 ? ':' : m) }
+          : { trash_id: f, original_name: f };
+      });
+      return { content: [{ type: "text", text: JSON.stringify(items, null, 2) }] };
+    } catch {
+      return { content: [{ type: "text", text: "Trash is empty or does not exist." }] };
+    }
+  }
+
+  async restoreFromTrash(args) {
+    const { trash_id } = args;
+    const trashPath = path.join(OBSIDIAN_VAULT_PATH, '.trash', trash_id);
+    const parts = trash_id.match(/^\\d{4}-\\d{2}-\\d{2}T[\\d-]+Z_(.+)$/);
+    const originalName = parts ? parts[1] : trash_id;
+    const restorePath = path.join(OBSIDIAN_VAULT_PATH, originalName);
+    try {
+      await fs.rename(trashPath, restorePath);
+      return { content: [{ type: "text", text: `Restored "${originalName}" from trash.` }] };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error restoring from trash: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+
+
+
+
+
+  async getAuditLog(args) {
+    const { last_n = 50 } = args || {};
+    const entries = await this.audit.getLast(Math.min(last_n, 200));
+    return {
+      content: [{
+        type: "text",
+        text: entries.length > 0
+          ? entries.map(e => JSON.stringify(e)).join('\n')
+          : "Audit log is empty or disabled.",
+      }],
+    };
   }
 
   async run() {
