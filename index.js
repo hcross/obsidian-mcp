@@ -14,6 +14,8 @@ import { marked } from "marked";
 import puppeteer from "puppeteer";
 import { parse } from "json2csv";
 import yaml from "js-yaml";
+import DOMPurify from "isomorphic-dompurify";
+import safeRegex from "safe-regex2";
 
 /**
  * Safely builds a YAML frontmatter block using js-yaml serialization.
@@ -27,6 +29,44 @@ function buildFrontmatter(fields) {
     Object.entries(fields).filter(([, v]) => v !== undefined && v !== null)
   );
   return `---\n${yaml.dump(clean, { lineWidth: -1 })}---\n`;
+}
+
+const SAFE_HTML_CONFIG = {
+  ALLOWED_TAGS: [
+    'p', 'br', 'hr',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'strong', 'em', 'b', 'i', 'u', 's', 'del', 'ins',
+    'code', 'pre', 'kbd', 'samp',
+    'blockquote', 'q', 'cite',
+    'ul', 'ol', 'li', 'dl', 'dt', 'dd',
+    'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td', 'caption',
+    'a', 'abbr', 'acronym',
+    'img',
+    'figure', 'figcaption',
+    'div', 'span',
+    'sup', 'sub',
+    'details', 'summary',
+  ],
+  ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'class', 'id', 'target', 'rel', 'width', 'height'],
+  ALLOW_DATA_ATTR: false,
+  FORCE_BODY: true,
+};
+
+function sanitizeHtml(rawHtml) {
+  return DOMPurify.sanitize(rawHtml, SAFE_HTML_CONFIG);
+}
+
+/**
+ * Compile a user-supplied regex pattern safely, rejecting ReDoS-prone patterns.
+ * All MCP tools accepting user-controlled patterns MUST use this function.
+ */
+function compileUserRegex(pattern, flags = '') {
+  if (typeof pattern !== 'string') throw new Error('Regex pattern must be a string');
+  if (pattern.length > 500) throw new Error('Regex pattern too long (max 500 chars)');
+  if (!safeRegex(pattern)) {
+    throw new Error(`Unsafe regex pattern rejected (potential ReDoS): ${pattern.substring(0, 50)}`);
+  }
+  return new RegExp(pattern, flags);
 }
 
 // Load .env file from the same directory as this script
@@ -3357,7 +3397,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
     </style>
 </head>
 <body>
-${bodyContent}
+${sanitizeHtml(bodyContent)}
 </body>
 </html>`;
 
