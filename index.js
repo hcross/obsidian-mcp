@@ -3817,7 +3817,7 @@ ${sanitizeHtml(bodyContent)}
     const { pattern, case_sensitive = false } = args;
     
     try {
-      const regex = new RegExp(pattern, case_sensitive ? 'g' : 'gi');
+      const regex = compileUserRegex(pattern, case_sensitive ? 'g' : 'gi');
       const files = await fs.readdir(OBSIDIAN_VAULT_PATH);
       const mdFiles = files.filter((f) => f.endsWith(".md"));
       const results = [];
@@ -6242,7 +6242,7 @@ ${noteLinks}
         throw new Error(`regexSearchAndReplace: scope contains ${files.length} files, which exceeds limit ${REPLACE_LIMIT}. Increase OBSIDIAN_REPLACE_LIMIT env var if needed.`);
       }
 
-      const regex = new RegExp(pattern, 'g');
+      const regex = compileUserRegex(pattern, 'g');
 
       if (dry_run) {
         const preview = [];
@@ -6266,9 +6266,6 @@ ${noteLinks}
         };
       }
 
-      let totalReplacements = 0;
-
-      const regex = new RegExp(pattern, 'g');
       let totalReplacements = 0;
 
       for (const file of files) {
