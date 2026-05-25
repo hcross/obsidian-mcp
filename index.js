@@ -80,9 +80,31 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 const VAULTS_BASE_PATH = process.env.VAULTS_BASE_PATH || process.cwd();
 let OBSIDIAN_VAULT_PATH = process.env.OBSIDIAN_VAULT_PATH || path.join(VAULTS_BASE_PATH, "CodeSnippets");
 
-// Guardrail limits for bulk destructive operations (H-05, H-06)
+// Guardrail limits for bulk destructive operations (H-05, H-06) and rate limiting (M-04, M-07)
 const BATCH_LIMIT = parseInt(process.env.OBSIDIAN_BATCH_LIMIT) || 50;
 const REPLACE_LIMIT = parseInt(process.env.OBSIDIAN_REPLACE_LIMIT) || 100;
+const SEARCH_RESULT_LIMIT = parseInt(process.env.OBSIDIAN_SEARCH_LIMIT) || 500;
+const QUERY_TIMEOUT_MS = parseInt(process.env.OBSIDIAN_QUERY_TIMEOUT_MS) || 10000;
+
+/**
+ * Wraps a promise with a timeout to prevent indefinite blocking (M-07).
+ *
+ * @param {Promise} promise       - The promise to race against the timeout
+ * @param {number}  ms            - Timeout in milliseconds
+ * @param {string}  operationName - Label used in the rejection error message
+ * @returns {Promise}
+ */
+function withTimeout(promise, ms, operationName) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`${operationName} timed out after ${ms}ms`)),
+        ms
+      )
+    ),
+  ]);
+}
 
 /**
  * Resolves a user-supplied path relative to the vault base and ensures it
@@ -2649,11 +2671,15 @@ ${relatedNotes.length > 0 ? `\n## Related Notes\n\n${relatedNotes.map(note => `-
       }
     }
 
+    const truncated = notes.length > SEARCH_RESULT_LIMIT;
+    const limitedNotes = notes.slice(0, SEARCH_RESULT_LIMIT);
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(notes, null, 2),
+          text: JSON.stringify(limitedNotes, null, 2) +
+            (truncated ? `\n\n[Results truncated: showing ${SEARCH_RESULT_LIMIT} of ${notes.length} notes. Set OBSIDIAN_SEARCH_LIMIT to increase.]` : ""),
         },
       ],
     };
@@ -2734,12 +2760,16 @@ ${relatedNotes.length > 0 ? `\n## Related Notes\n\n${relatedNotes.map(note => `-
       }
     }
 
+    const truncated = results.length > SEARCH_RESULT_LIMIT;
+    const limitedResults = results.slice(0, SEARCH_RESULT_LIMIT);
+
     return {
       content: [
         {
           type: "text",
-          text: results.length > 0 
-            ? JSON.stringify(results, null, 2)
+          text: limitedResults.length > 0
+            ? JSON.stringify(limitedResults, null, 2) +
+              (truncated ? `\n\n[Results truncated: showing ${SEARCH_RESULT_LIMIT} of ${results.length} matches. Set OBSIDIAN_SEARCH_LIMIT to increase.]` : "")
             : "No matching notes found",
         },
       ],
@@ -5386,61 +5416,66 @@ ${noteLinks}
   // ===== DATAVIEW QUERY EXECUTION METHODS =====
 
   async executeDataviewQuery(args) {
-    const { query } = args;
-
     try {
-      // Simple implementation: parse basic LIST/TABLE queries
-      const files = await fs.readdir(OBSIDIAN_VAULT_PATH);
-      const mdFiles = files.filter(f => f.endsWith('.md'));
-      const notes = [];
-
-      for (const file of mdFiles) {
-        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
-        const content = await fs.readFile(filepath, 'utf-8');
-        const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
-        
-        if (frontmatterMatch) {
-          const metadata = {};
-          const lines = frontmatterMatch[1].split('\n');
-          lines.forEach(line => {
-            const match = line.match(/^(\w+):\s*(.+)$/);
-            if (match) {
-              metadata[match[1]] = match[2];
-            }
-          });
-          notes.push({ file, ...metadata });
-        }
-      }
-
-      // Basic query execution (simplified)
-      let results = notes;
-      if (query.includes('WHERE')) {
-        const whereMatch = query.match(/WHERE\s+(.+)/i);
-        if (whereMatch) {
-          // Simple tag filter
-          const tagMatch = whereMatch[1].match(/#(\w+)/);
-          if (tagMatch) {
-            const tag = tagMatch[1];
-            results = results.filter(n => n.tags && n.tags.includes(tag));
-          }
-        }
-      }
-
-      return {
-        content: [{
-          type: "text",
-          text: `Query Results (${results.length} items):\n\n${JSON.stringify(results, null, 2)}\n\nNote: This is a simplified Dataview implementation. For full DQL support, use Obsidian with Dataview plugin.`,
-        }],
-      };
+      return await withTimeout(
+        this._executeDataviewQueryInternal(args),
+        QUERY_TIMEOUT_MS,
+        'executeDataviewQuery'
+      );
     } catch (error) {
       return {
-        content: [{
-          type: "text",
-          text: `Error executing dataview query: ${error.message}`,
-        }],
+        content: [{ type: "text", text: `executeDataviewQuery: ${error.message}` }],
         isError: true,
       };
     }
+  }
+
+  async _executeDataviewQueryInternal(args) {
+    const { query } = args;
+
+    // Simple implementation: parse basic LIST/TABLE queries
+    const files = await fs.readdir(OBSIDIAN_VAULT_PATH);
+    const mdFiles = files.filter(f => f.endsWith('.md'));
+    const notes = [];
+
+    for (const file of mdFiles) {
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
+      const content = await fs.readFile(filepath, 'utf-8');
+      const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+      
+      if (frontmatterMatch) {
+        const metadata = {};
+        const lines = frontmatterMatch[1].split('\n');
+        lines.forEach(line => {
+          const match = line.match(/^(\w+):\s*(.+)$/);
+          if (match) {
+            metadata[match[1]] = match[2];
+          }
+        });
+        notes.push({ file, ...metadata });
+      }
+    }
+
+    // Basic query execution (simplified)
+    let results = notes;
+    if (query.includes('WHERE')) {
+      const whereMatch = query.match(/WHERE\s+(.+)/i);
+      if (whereMatch) {
+        // Simple tag filter
+        const tagMatch = whereMatch[1].match(/#(\w+)/);
+        if (tagMatch) {
+          const tag = tagMatch[1];
+          results = results.filter(n => n.tags && n.tags.includes(tag));
+        }
+      }
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: `Query Results (${results.length} items):\n\n${JSON.stringify(results, null, 2)}\n\nNote: This is a simplified Dataview implementation. For full DQL support, use Obsidian with Dataview plugin.`,
+      }],
+    };
   }
 
   async createDataviewCodeblock(args) {
