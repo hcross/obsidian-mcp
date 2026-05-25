@@ -128,6 +128,24 @@ async function moveToTrash(filepath) {
   return trashPath;
 }
 
+async function moveToTrash(filepath) {
+  if (process.env.OBSIDIAN_HARD_DELETE === 'true') {
+    await fs.unlink(filepath);
+    return null;
+  }
+
+  const trashDir = path.join(OBSIDIAN_VAULT_PATH, '.trash');
+  await fs.mkdir(trashDir, { recursive: true });
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const basename = path.basename(filepath);
+  const trashName = `${timestamp}_${basename}`;
+  const trashPath = path.join(trashDir, trashName);
+
+  await fs.rename(filepath, trashPath);
+  return trashPath;
+}
+
 class ObsidianMCPServer {
   constructor() {
     this.server = new Server(
@@ -2170,6 +2188,29 @@ class ObsidianMCPServer {
             required: ["filename"],
           },
         },
+        {
+          name: "list_trash",
+          description: "List all files currently in the vault's .trash folder",
+          inputSchema: {
+            type: "object",
+            properties: {},
+            required: [],
+          },
+        },
+        {
+          name: "restore_from_trash",
+          description: "Restore a file from the vault's .trash folder back to the vault root",
+          inputSchema: {
+            type: "object",
+            properties: {
+              trash_id: {
+                type: "string",
+                description: "The trash entry filename (as returned by list_trash)",
+              },
+            },
+            required: ["trash_id"],
+          },
+        },
       ],
     }));
 
@@ -2427,6 +2468,10 @@ class ObsidianMCPServer {
           return await this.mergeNotesEnhanced(request.params.arguments);
         case "split_note_by_headings":
           return await this.splitNoteByHeadings(request.params.arguments);
+        case "list_trash":
+          return await this.listTrash(request.params.arguments);
+        case "restore_from_trash":
+          return await this.restoreFromTrash(request.params.arguments);
         default:
           throw new Error(`Unknown tool: ${request.params.name}`);
       }
@@ -4766,14 +4811,17 @@ ${noteLinks}
 
       if (delete_originals) {
         for (const filename of filenames) {
-          await fs.unlink(safeVaultPath(OBSIDIAN_VAULT_PATH, filename));
+          await moveToTrash(safeVaultPath(OBSIDIAN_VAULT_PATH, filename));
         }
       }
 
+      const deleteLabel = delete_originals
+        ? (process.env.OBSIDIAN_HARD_DELETE === 'true' ? ' (originals deleted)' : ' (originals moved to trash)')
+        : '';
       return {
         content: [{
           type: "text",
-          text: `Merged ${filenames.length} notes into ${output_filename}${delete_originals ? ' (originals deleted)' : ''}`,
+          text: `Merged ${filenames.length} notes into ${output_filename}${deleteLabel}`,
         }],
       };
     } catch (error) {
@@ -7694,6 +7742,72 @@ Note: For full version history, use a git repository or Obsidian Sync.
           type: "text",
           text: `Error splitting note: ${error.message}`,
         }],
+        isError: true,
+      };
+    }
+  }
+
+  async listTrash(args) {
+    const trashDir = path.join(OBSIDIAN_VAULT_PATH, '.trash');
+    try {
+      const files = await fs.readdir(trashDir);
+      const items = files.map(f => {
+        const parts = f.match(/^(\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}Z)_(.+)$/);
+        return parts
+          ? { trash_id: f, original_name: parts[2], deleted_at: parts[1].replace(/-/g, (m, o) => o > 18 ? ':' : m) }
+          : { trash_id: f, original_name: f };
+      });
+      return { content: [{ type: "text", text: JSON.stringify(items, null, 2) }] };
+    } catch {
+      return { content: [{ type: "text", text: "Trash is empty or does not exist." }] };
+    }
+  }
+
+  async restoreFromTrash(args) {
+    const { trash_id } = args;
+    const trashPath = path.join(OBSIDIAN_VAULT_PATH, '.trash', trash_id);
+    const parts = trash_id.match(/^\\d{4}-\\d{2}-\\d{2}T[\\d-]+Z_(.+)$/);
+    const originalName = parts ? parts[1] : trash_id;
+    const restorePath = path.join(OBSIDIAN_VAULT_PATH, originalName);
+    try {
+      await fs.rename(trashPath, restorePath);
+      return { content: [{ type: "text", text: `Restored "${originalName}" from trash.` }] };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error restoring from trash: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+
+  async listTrash(args) {
+    const trashDir = path.join(OBSIDIAN_VAULT_PATH, '.trash');
+    try {
+      const files = await fs.readdir(trashDir);
+      const items = files.map(f => {
+        const parts = f.match(/^(\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}Z)_(.+)$/);
+        return parts
+          ? { trash_id: f, original_name: parts[2], deleted_at: parts[1].replace(/-/g, (m, o) => o > 18 ? ':' : m) }
+          : { trash_id: f, original_name: f };
+      });
+      return { content: [{ type: "text", text: JSON.stringify(items, null, 2) }] };
+    } catch {
+      return { content: [{ type: "text", text: "Trash is empty or does not exist." }] };
+    }
+  }
+
+  async restoreFromTrash(args) {
+    const { trash_id } = args;
+    const trashPath = path.join(OBSIDIAN_VAULT_PATH, '.trash', trash_id);
+    const parts = trash_id.match(/^\\d{4}-\\d{2}-\\d{2}T[\\d-]+Z_(.+)$/);
+    const originalName = parts ? parts[1] : trash_id;
+    const restorePath = path.join(OBSIDIAN_VAULT_PATH, originalName);
+    try {
+      await fs.rename(trashPath, restorePath);
+      return { content: [{ type: "text", text: `Restored "${originalName}" from trash.` }] };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error restoring from trash: ${error.message}` }],
         isError: true,
       };
     }
