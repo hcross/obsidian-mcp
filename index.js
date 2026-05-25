@@ -24,6 +24,25 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 const VAULTS_BASE_PATH = process.env.VAULTS_BASE_PATH || process.cwd();
 let OBSIDIAN_VAULT_PATH = process.env.OBSIDIAN_VAULT_PATH || path.join(VAULTS_BASE_PATH, "CodeSnippets");
 
+/**
+ * Resolves a user-supplied path relative to the vault base and ensures it
+ * stays within the vault boundary (no path traversal).
+ *
+ * @param {string} base      - Absolute vault root (OBSIDIAN_VAULT_PATH)
+ * @param {string} userInput - Relative path provided by the caller
+ * @returns {string} Fully-resolved, safe absolute path
+ * @throws {Error} If the resolved path escapes the vault
+ */
+function safeVaultPath(base, userInput) {
+  if (typeof userInput !== 'string') throw new Error('Path must be a string');
+  const vaultBase = path.resolve(base);
+  const resolved = path.resolve(vaultBase, userInput);
+  if (!resolved.startsWith(vaultBase + path.sep) && resolved !== vaultBase) {
+    throw new Error(`Path traversal detected: "${userInput}" resolves outside vault`);
+  }
+  return resolved;
+}
+
 class ObsidianMCPServer {
   constructor() {
     this.server = new Server(
@@ -2325,7 +2344,7 @@ class ObsidianMCPServer {
     const { title, code, language, description, tags = [] } = args;
     const timestamp = new Date().toISOString();
     const filename = this.sanitizeFilename(title) + ".md";
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     const relatedNotes = await this.findRelatedNotes(tags, language);
 
@@ -2369,7 +2388,7 @@ ${relatedNotes.length > 0 ? `## Related Notes\n\n${relatedNotes.map(note => `- [
     const { title, summary, key_insights = [], code_snippets = [], tags = [] } = args;
     const timestamp = new Date().toISOString();
     const filename = this.sanitizeFilename(title) + ".md";
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     const languages = [...new Set(code_snippets.map(s => s.language).filter(Boolean))];
     const relatedNotes = await this.findRelatedNotes(tags, languages.join(','));
@@ -2427,7 +2446,7 @@ ${relatedNotes.length > 0 ? `## Related Notes\n\n${relatedNotes.map(note => `- [
     const { title, content, tags = [] } = args;
     const timestamp = new Date().toISOString();
     const filename = this.sanitizeFilename(title) + ".md";
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     const relatedNotes = await this.findRelatedNotes(tags, null);
 
@@ -2467,7 +2486,7 @@ ${relatedNotes.length > 0 ? `\n## Related Notes\n\n${relatedNotes.map(note => `-
 
     let notes = [];
     for (const file of mdFiles) {
-      const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
       const content = await fs.readFile(filepath, "utf-8");
       
       const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
@@ -2507,7 +2526,7 @@ ${relatedNotes.length > 0 ? `\n## Related Notes\n\n${relatedNotes.map(note => `-
 
   async readNote(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -2539,7 +2558,7 @@ ${relatedNotes.length > 0 ? `\n## Related Notes\n\n${relatedNotes.map(note => `-
 
     let results = [];
     for (const file of mdFiles) {
-      const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
       const content = await fs.readFile(filepath, "utf-8");
 
       let matches = false;
@@ -2672,37 +2691,17 @@ Start saving code snippets, thread summaries, and knowledge notes!
     }
   }
 
-  async switchVault(args) {
-    const { name } = args;
-    const vaultPath = path.join(VAULTS_BASE_PATH, name);
-
-    try {
-      const stats = await fs.stat(vaultPath);
-      if (!stats.isDirectory()) {
-        throw new Error(`${name} is not a directory`);
-      }
-
-      OBSIDIAN_VAULT_PATH = vaultPath;
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Switched to vault "${name}"`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error switching vault: ${error.message}. Vault may not exist.`,
-          },
-        ],
-        isError: true,
-      };
-    }
+  async switchVault(_args) {
+    // C-02 fix: runtime vault switching disabled — it allowed bypassing the vault
+    // boundary by overwriting the global OBSIDIAN_VAULT_PATH at runtime.
+    // Use the OBSIDIAN_VAULT_PATH environment variable and restart the server instead.
+    return {
+      content: [{
+        type: "text",
+        text: "Switching vault requires restarting the MCP server with the new OBSIDIAN_VAULT_PATH environment variable. Runtime vault switching is disabled for security reasons.",
+      }],
+      isError: true,
+    };
   }
 
   async findRelatedNotes(tags = [], language = null) {
@@ -2713,7 +2712,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
       const relatedNotes = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
 
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
@@ -2770,7 +2769,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async updateNote(args) {
     const { filename, content, preserve_metadata = true } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let finalContent = content;
@@ -2806,7 +2805,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async deleteNote(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       await fs.unlink(filepath);
@@ -2829,7 +2828,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async appendToNote(args) {
     const { filename, content } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const existingContent = await fs.readFile(filepath, "utf-8");
@@ -2855,7 +2854,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async createFolder(args) {
     const { folder_path } = args;
-    const fullPath = path.join(OBSIDIAN_VAULT_PATH, folder_path);
+    const fullPath = safeVaultPath(OBSIDIAN_VAULT_PATH, folder_path);
 
     try {
       await fs.mkdir(fullPath, { recursive: true });
@@ -2878,8 +2877,8 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async moveNote(args) {
     const { filename, destination_folder } = args;
-    const sourcePath = path.join(OBSIDIAN_VAULT_PATH, filename);
-    const destFolder = path.join(OBSIDIAN_VAULT_PATH, destination_folder);
+    const sourcePath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
+    const destFolder = safeVaultPath(OBSIDIAN_VAULT_PATH, destination_folder);
     const destPath = path.join(destFolder, filename);
 
     try {
@@ -2905,9 +2904,9 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async renameNote(args) {
     const { old_filename, new_filename } = args;
-    const oldPath = path.join(OBSIDIAN_VAULT_PATH, old_filename);
+    const oldPath = safeVaultPath(OBSIDIAN_VAULT_PATH, old_filename);
     const newFilename = new_filename.endsWith('.md') ? new_filename : `${new_filename}.md`;
-    const newPath = path.join(OBSIDIAN_VAULT_PATH, newFilename);
+    const newPath = safeVaultPath(OBSIDIAN_VAULT_PATH, newFilename);
 
     try {
       await fs.rename(oldPath, newPath);
@@ -2931,7 +2930,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async addTags(args) {
     const { filename, tags } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -2987,7 +2986,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
 
   async removeTags(args) {
     const { filename, tags } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -3047,7 +3046,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
       const allTags = new Set();
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -3092,7 +3091,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
       const mdFiles = files.filter((f) => f.endsWith(".md") && f !== filename);
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         
         const linkPattern = new RegExp(`\\[\\[${noteName}[\\]|]`, 'g');
@@ -3133,7 +3132,7 @@ Start saving code snippets, thread summaries, and knowledge notes!
     const today = new Date();
     const dateStr = today.toISOString().split('T')[0];
     const filename = `${dateStr}.md`;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const exists = await fs.access(filepath).then(() => true).catch(() => false);
@@ -3195,7 +3194,7 @@ tags: ["daily"]
       const noteTypes = {};
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         
         const words = content.split(/\s+/).length;
@@ -3257,7 +3256,7 @@ tags: ["daily"]
       const brokenLinks = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         
         const links = content.match(/\[\[(.*?)\]\]/g) || [];
@@ -3298,7 +3297,7 @@ tags: ["daily"]
 
   async exportNoteHtml(args) {
     const { filename, output_path } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -3360,7 +3359,7 @@ ${bodyContent}
 
   async suggestTags(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -3371,7 +3370,7 @@ ${bodyContent}
       const existingTags = new Set();
 
       for (const file of mdFiles) {
-        const fp = path.join(OBSIDIAN_VAULT_PATH, file);
+        const fp = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const fc = await fs.readFile(fp, "utf-8");
         const fm = fc.match(/^---\n([\s\S]*?)\n---/);
         if (fm) {
@@ -3439,7 +3438,7 @@ ${bodyContent}
       const results = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const stats = await fs.stat(filepath);
         const content = await fs.readFile(filepath, "utf-8");
         
@@ -3494,7 +3493,7 @@ ${bodyContent}
       const orphans = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const noteName = file.replace('.md', '');
         
@@ -3503,7 +3502,7 @@ ${bodyContent}
         let hasIncomingLinks = false;
         for (const otherFile of mdFiles) {
           if (otherFile === file) continue;
-          const otherPath = path.join(OBSIDIAN_VAULT_PATH, otherFile);
+          const otherPath = safeVaultPath(OBSIDIAN_VAULT_PATH, otherFile);
           const otherContent = await fs.readFile(otherPath, "utf-8");
           if (otherContent.includes(`[[${noteName}`)) {
             hasIncomingLinks = true;
@@ -3543,7 +3542,7 @@ ${bodyContent}
       const untagged = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -3588,7 +3587,7 @@ ${bodyContent}
       const results = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const matches = content.match(regex);
         
@@ -3631,7 +3630,7 @@ ${bodyContent}
       const results = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const wordCount = content.split(/\s+/).length;
         
@@ -3675,7 +3674,7 @@ ${bodyContent}
       const todos = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const lines = content.split('\n');
         
@@ -3725,7 +3724,7 @@ ${bodyContent}
 
   async markTaskComplete(args) {
     const { filename, task_text } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -3772,7 +3771,7 @@ ${bodyContent}
       const tasksByFile = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const pending = (content.match(/^[-*]\s+\[ \]/gm) || []).length;
         const completed = (content.match(/^[-*]\s+\[x\]/gim) || []).length;
@@ -3817,7 +3816,7 @@ ${bodyContent}
   async createTaskNote(args) {
     const { title, tasks } = args;
     const filename = this.sanitizeFilename(title) + ".md";
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
     const timestamp = new Date().toISOString();
 
     const taskList = tasks.map(task => `- [ ] ${task}`).join('\n');
@@ -3866,7 +3865,7 @@ ${taskList}
       const todos = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
@@ -3918,7 +3917,7 @@ ${taskList}
 
   async createTemplate(args) {
     const { template_name, content } = args;
-    const templateDir = path.join(OBSIDIAN_VAULT_PATH, '.templates');
+    const templateDir = safeVaultPath(OBSIDIAN_VAULT_PATH, '.templates');
     const filepath = path.join(templateDir, `${this.sanitizeFilename(template_name)}.template.md`);
 
     try {
@@ -3944,9 +3943,9 @@ ${taskList}
 
   async applyTemplate(args) {
     const { template_name, filename, variables = {} } = args;
-    const templateDir = path.join(OBSIDIAN_VAULT_PATH, '.templates');
+    const templateDir = safeVaultPath(OBSIDIAN_VAULT_PATH, '.templates');
     const templatePath = path.join(templateDir, `${this.sanitizeFilename(template_name)}.template.md`);
-    const outputPath = path.join(OBSIDIAN_VAULT_PATH, filename.endsWith('.md') ? filename : `${filename}.md`);
+    const outputPath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename.endsWith('.md') ? filename : `${filename}.md`);
 
     try {
       let content = await fs.readFile(templatePath, "utf-8");
@@ -3979,7 +3978,7 @@ ${taskList}
   }
 
   async listTemplates(args) {
-    const templateDir = path.join(OBSIDIAN_VAULT_PATH, '.templates');
+    const templateDir = safeVaultPath(OBSIDIAN_VAULT_PATH, '.templates');
 
     try {
       const exists = await fs.access(templateDir).then(() => true).catch(() => false);
@@ -4016,7 +4015,7 @@ ${taskList}
 
   async suggestLinks(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -4028,7 +4027,7 @@ ${taskList}
       for (const file of mdFiles) {
         const noteName = file.replace('.md', '');
         if (bodyContent.includes(noteName.toLowerCase()) && !content.includes(`[[${noteName}`)) {
-          const otherPath = path.join(OBSIDIAN_VAULT_PATH, file);
+          const otherPath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
           const otherContent = await fs.readFile(otherPath, "utf-8");
           const otherWords = new Set(otherContent.toLowerCase().split(/\s+/));
           const thisWords = new Set(bodyContent.split(/\s+/));
@@ -4068,7 +4067,7 @@ ${taskList}
   async createMoc(args) {
     const { title, tag } = args;
     const filename = this.sanitizeFilename(title) + ".md";
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const files = await fs.readdir(OBSIDIAN_VAULT_PATH);
@@ -4076,7 +4075,7 @@ ${taskList}
       const relatedNotes = [];
 
       for (const file of mdFiles) {
-        const filePath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filePath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filePath, "utf-8");
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -4144,7 +4143,7 @@ ${noteLinks}
       const graph = { nodes: [], links: [] };
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const noteName = file.replace('.md', '');
         
@@ -4187,7 +4186,7 @@ ${noteLinks}
       const connections = new Map();
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const noteName = file.replace('.md', '');
         
@@ -4196,7 +4195,7 @@ ${noteLinks}
         let incoming = 0;
         for (const otherFile of mdFiles) {
           if (otherFile === file) continue;
-          const otherPath = path.join(OBSIDIAN_VAULT_PATH, otherFile);
+          const otherPath = safeVaultPath(OBSIDIAN_VAULT_PATH, otherFile);
           const otherContent = await fs.readFile(otherPath, "utf-8");
           if (otherContent.includes(`[[${noteName}`)) {
             incoming++;
@@ -4237,7 +4236,7 @@ ${noteLinks}
 
   async extractLinks(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -4293,7 +4292,7 @@ ${noteLinks}
       const stopWords = new Set(['that', 'this', 'with', 'from', 'have', 'been', 'were', 'will', 'your', 'there', 'their', 'what', 'when', 'where', 'which', 'while', 'would', 'could', 'should']);
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '');
         const words = bodyContent.toLowerCase().match(/\b[a-z]+\b/g) || [];
@@ -4332,7 +4331,7 @@ ${noteLinks}
 
   async extractCodeBlocks(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -4382,7 +4381,7 @@ ${noteLinks}
       const timeline = {};
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -4433,7 +4432,7 @@ ${noteLinks}
 
   async noteComplexity(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -4572,18 +4571,20 @@ ${noteLinks}
     const { source_path, destination_folder = '' } = args;
 
     try {
-      const destPath = destination_folder 
-        ? path.join(OBSIDIAN_VAULT_PATH, destination_folder)
+      // C-03 fix: source_path must be inside the vault — no arbitrary filesystem reads.
+      const resolvedSource = safeVaultPath(OBSIDIAN_VAULT_PATH, source_path);
+      const destPath = destination_folder
+        ? safeVaultPath(OBSIDIAN_VAULT_PATH, destination_folder)
         : OBSIDIAN_VAULT_PATH;
 
       await fs.mkdir(destPath, { recursive: true });
 
-      const files = await fs.readdir(source_path);
+      const files = await fs.readdir(resolvedSource);
       const mdFiles = files.filter(f => f.endsWith('.md'));
       let imported = 0;
 
       for (const file of mdFiles) {
-        const sourcePath = path.join(source_path, file);
+        const sourcePath = path.join(resolvedSource, file);
         const targetPath = path.join(destPath, file);
         await fs.copyFile(sourcePath, targetPath);
         imported++;
@@ -4592,7 +4593,7 @@ ${noteLinks}
       return {
         content: [{
           type: "text",
-          text: `Imported ${imported} markdown files from ${source_path}`,
+          text: `Imported ${imported} markdown files from ${resolvedSource}`,
         }],
       };
     } catch (error) {
@@ -4645,7 +4646,7 @@ ${noteLinks}
 
   async mergeNotes(args) {
     const { filenames, output_filename, delete_originals = false } = args;
-    const outputPath = path.join(OBSIDIAN_VAULT_PATH, output_filename.endsWith('.md') ? output_filename : `${output_filename}.md`);
+    const outputPath = safeVaultPath(OBSIDIAN_VAULT_PATH, output_filename.endsWith('.md') ? output_filename : `${output_filename}.md`);
 
     try {
       let mergedContent = `---
@@ -4661,7 +4662,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 `;
 
       for (const filename of filenames) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
         const content = await fs.readFile(filepath, "utf-8");
         const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '');
         
@@ -4673,7 +4674,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
       if (delete_originals) {
         for (const filename of filenames) {
-          await fs.unlink(path.join(OBSIDIAN_VAULT_PATH, filename));
+          await fs.unlink(safeVaultPath(OBSIDIAN_VAULT_PATH, filename));
         }
       }
 
@@ -4696,9 +4697,9 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async duplicateNote(args) {
     const { filename, new_filename } = args;
-    const sourcePath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const sourcePath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
     const destFilename = new_filename.endsWith('.md') ? new_filename : `${new_filename}.md`;
-    const destPath = path.join(OBSIDIAN_VAULT_PATH, destFilename);
+    const destPath = safeVaultPath(OBSIDIAN_VAULT_PATH, destFilename);
 
     try {
       await fs.copyFile(sourcePath, destPath);
@@ -4722,8 +4723,8 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async archiveNote(args) {
     const { filename } = args;
-    const sourcePath = path.join(OBSIDIAN_VAULT_PATH, filename);
-    const archiveDir = path.join(OBSIDIAN_VAULT_PATH, 'Archive');
+    const sourcePath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
+    const archiveDir = safeVaultPath(OBSIDIAN_VAULT_PATH, 'Archive');
     const destPath = path.join(archiveDir, filename);
 
     try {
@@ -4749,7 +4750,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async exportNotePdf(args) {
     const { filename, output_path } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -4830,7 +4831,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       
       const notes = [];
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -4959,7 +4960,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async exportNoteMarkdown(args) {
     const { filename, output_path, resolve_links = false } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let content = await fs.readFile(filepath, "utf-8");
@@ -4969,7 +4970,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
         for (const link of links) {
           const linkName = link.slice(2, -2).split('|')[0];
           const linkedFile = `${linkName}.md`;
-          const linkedPath = path.join(OBSIDIAN_VAULT_PATH, linkedFile);
+          const linkedPath = safeVaultPath(OBSIDIAN_VAULT_PATH, linkedFile);
           
           try {
             const linkedContent = await fs.readFile(linkedPath, "utf-8");
@@ -5014,7 +5015,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       };
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -5073,7 +5074,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const rows = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, "utf-8");
         const stats = await fs.stat(filepath);
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
@@ -5126,7 +5127,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async exportNotePlaintext(args) {
     const { filename, output_path } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, "utf-8");
@@ -5215,7 +5216,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
   
   async createCanvas(args) {
     const { name } = args;
-    const canvasPath = path.join(OBSIDIAN_VAULT_PATH, `${name}.canvas`);
+    const canvasPath = safeVaultPath(OBSIDIAN_VAULT_PATH, `${name}.canvas`);
 
     try {
       const canvasData = {
@@ -5244,7 +5245,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async addCardToCanvas(args) {
     const { canvas_name, card_type, content, x = 0, y = 0, width = 400, height = 200 } = args;
-    const canvasPath = path.join(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
+    const canvasPath = safeVaultPath(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
 
     try {
       const canvasData = JSON.parse(await fs.readFile(canvasPath, 'utf-8'));
@@ -5285,7 +5286,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async addConnectionToCanvas(args) {
     const { canvas_name, from_id, to_id } = args;
-    const canvasPath = path.join(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
+    const canvasPath = safeVaultPath(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
 
     try {
       const canvasData = JSON.parse(await fs.readFile(canvasPath, 'utf-8'));
@@ -5319,7 +5320,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async createCanvasGroup(args) {
     const { canvas_name, label, card_ids } = args;
-    const canvasPath = path.join(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
+    const canvasPath = safeVaultPath(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
 
     try {
       const canvasData = JSON.parse(await fs.readFile(canvasPath, 'utf-8'));
@@ -5369,7 +5370,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async readCanvas(args) {
     const { canvas_name } = args;
-    const canvasPath = path.join(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
+    const canvasPath = safeVaultPath(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
 
     try {
       const canvasData = JSON.parse(await fs.readFile(canvasPath, 'utf-8'));
@@ -5393,7 +5394,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async updateCanvasCard(args) {
     const { canvas_name, card_id, updates } = args;
-    const canvasPath = path.join(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
+    const canvasPath = safeVaultPath(OBSIDIAN_VAULT_PATH, canvas_name.endsWith('.canvas') ? canvas_name : `${canvas_name}.canvas`);
 
     try {
       const canvasData = JSON.parse(await fs.readFile(canvasPath, 'utf-8'));
@@ -5435,7 +5436,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const notes = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -5485,7 +5486,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async createDataviewCodeblock(args) {
     const { filename, query } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let content = await fs.readFile(filepath, 'utf-8');
@@ -5557,7 +5558,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const edges = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         
         nodes.push({ id: file, label: file.replace('.md', '') });
@@ -5612,7 +5613,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       }
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const links = content.match(/\[\[([^\]]+)\]\]/g) || [];
         
@@ -5683,7 +5684,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       }
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const links = content.match(/\[\[([^\]]+)\]\]/g) || [];
         
@@ -5736,7 +5737,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       }
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const links = content.match(/\[\[([^\]]+)\]\]/g) || [];
         
@@ -5803,7 +5804,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       }
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         
         // Count outbound links
@@ -5950,7 +5951,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
     const { file_types } = args || {};
 
     try {
-      const attachDir = path.join(OBSIDIAN_VAULT_PATH, 'attachments');
+      const attachDir = safeVaultPath(OBSIDIAN_VAULT_PATH, 'attachments');
       let files = [];
 
       try {
@@ -6000,13 +6001,16 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
     const { source_path, dest_name } = args;
 
     try {
-      const attachDir = path.join(OBSIDIAN_VAULT_PATH, 'attachments');
+      // C-04 fix: source_path must be inside the vault — prevents exfiltrating
+      // arbitrary system files into the vault's attachments directory.
+      const resolvedSource = safeVaultPath(OBSIDIAN_VAULT_PATH, source_path);
+      const attachDir = safeVaultPath(OBSIDIAN_VAULT_PATH, 'attachments');
       await fs.mkdir(attachDir, { recursive: true });
 
-      const filename = dest_name || path.basename(source_path);
+      const filename = dest_name || path.basename(resolvedSource);
       const destPath = path.join(attachDir, filename);
 
-      await fs.copyFile(source_path, destPath);
+      await fs.copyFile(resolvedSource, destPath);
 
       return {
         content: [{
@@ -6029,7 +6033,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
     const { filename } = args;
 
     try {
-      const attachPath = path.join(OBSIDIAN_VAULT_PATH, 'attachments', filename);
+      const attachPath = safeVaultPath(OBSIDIAN_VAULT_PATH, 'attachments', filename);
       await fs.unlink(attachPath);
 
       return {
@@ -6051,7 +6055,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async findOrphanedAttachments(args) {
     try {
-      const attachDir = path.join(OBSIDIAN_VAULT_PATH, 'attachments');
+      const attachDir = safeVaultPath(OBSIDIAN_VAULT_PATH, 'attachments');
       let attachments = [];
 
       try {
@@ -6071,7 +6075,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       let allContent = '';
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         allContent += content;
       }
@@ -6104,7 +6108,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const references = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         
         if (content.includes(filename)) {
@@ -6140,7 +6144,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       let totalReplacements = 0;
 
       for (const file of files) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         try {
           let content = await fs.readFile(filepath, 'utf-8');
           const matches = (content.match(regex) || []).length;
@@ -6181,7 +6185,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const results = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -6219,7 +6223,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const results = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         let links = [];
 
@@ -6260,7 +6264,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       let replacements = 0;
 
       for (const file of filenames) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         try {
           let content = await fs.readFile(filepath, 'utf-8');
           const occurrences = (content.match(new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
@@ -6296,7 +6300,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async updateFrontmatterField(args) {
     const { filename, field, value } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let content = await fs.readFile(filepath, 'utf-8');
@@ -6367,7 +6371,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
 
   async validateFrontmatterSchema(args) {
     const { filename, schema } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, 'utf-8');
@@ -6432,7 +6436,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const properties = new Set();
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -6472,7 +6476,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       let updated = 0;
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         let content = await fs.readFile(filepath, 'utf-8');
         const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -6514,7 +6518,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       const values = new Map();
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
         
@@ -6552,7 +6556,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
     const { template_name, filename, variables = {} } = args;
     
     try {
-      const templatePath = path.join(OBSIDIAN_VAULT_PATH, 'Templates', `${template_name}.md`);
+      const templatePath = safeVaultPath(OBSIDIAN_VAULT_PATH, 'Templates', `${template_name}.md`);
       let template = await fs.readFile(templatePath, 'utf-8');
 
       // Replace variables
@@ -6564,7 +6568,7 @@ merged_from: [${filenames.map(f => `"${f}"`).join(', ')}]
       template = template.replace(/{{date}}/g, new Date().toISOString().split('T')[0]);
       template = template.replace(/{{datetime}}/g, new Date().toISOString());
 
-      const outputPath = path.join(OBSIDIAN_VAULT_PATH, filename.endsWith('.md') ? filename : `${filename}.md`);
+      const outputPath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename.endsWith('.md') ? filename : `${filename}.md`);
       await fs.writeFile(outputPath, template, 'utf-8');
 
       return {
@@ -6620,7 +6624,7 @@ tags: ["books", "literature"]
 `;
 
     try {
-      const filepath = path.join(OBSIDIAN_VAULT_PATH, `${filename}.md`);
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, `${filename}.md`);
       await fs.writeFile(filepath, content, 'utf-8');
 
       return {
@@ -6672,7 +6676,7 @@ tags: ["people", "contacts"]
 `;
 
     try {
-      const filepath = path.join(OBSIDIAN_VAULT_PATH, `${filename}.md`);
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, `${filename}.md`);
       await fs.writeFile(filepath, content, 'utf-8');
 
       return {
@@ -6728,7 +6732,7 @@ tags: ["meetings"]
 `;
 
     try {
-      const filepath = path.join(OBSIDIAN_VAULT_PATH, `${filename}.md`);
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, `${filename}.md`);
       await fs.writeFile(filepath, content, 'utf-8');
 
       return {
@@ -6795,7 +6799,7 @@ tags: ["projects"]
 `;
 
     try {
-      const filepath = path.join(OBSIDIAN_VAULT_PATH, `${filename}.md`);
+      const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, `${filename}.md`);
       await fs.writeFile(filepath, content, 'utf-8');
 
       return {
@@ -6826,7 +6830,7 @@ tags: ["projects"]
       const tasks = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const lines = content.split('\n');
         
@@ -6871,8 +6875,8 @@ tags: ["projects"]
     const { source_file, dest_file, task_text } = args;
 
     try {
-      const sourcePath = path.join(OBSIDIAN_VAULT_PATH, source_file);
-      const destPath = path.join(OBSIDIAN_VAULT_PATH, dest_file);
+      const sourcePath = safeVaultPath(OBSIDIAN_VAULT_PATH, source_file);
+      const destPath = safeVaultPath(OBSIDIAN_VAULT_PATH, dest_file);
 
       let sourceContent = await fs.readFile(sourcePath, 'utf-8');
       let destContent = await fs.readFile(destPath, 'utf-8');
@@ -6912,7 +6916,7 @@ tags: ["projects"]
 
   async addTaskMetadata(args) {
     const { filename, task_text, metadata } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let content = await fs.readFile(filepath, 'utf-8');
@@ -6962,7 +6966,7 @@ tags: ["projects"]
       const tasks = { pending: [], completed: [] };
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const lines = content.split('\n');
         
@@ -7001,7 +7005,7 @@ ${tasks.pending.map(t => `- [ ] ${t.text} (${t.file})`).join('\n') || '(none)'}
 ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x] ${t.text} (${t.file})`).join('\n') || '(none)'}` : ''}
 `;
 
-      const reportPath = path.join(OBSIDIAN_VAULT_PATH, output_filename);
+      const reportPath = safeVaultPath(OBSIDIAN_VAULT_PATH, output_filename);
       await fs.writeFile(reportPath, reportContent, 'utf-8');
 
       return {
@@ -7028,7 +7032,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       const blockedTasks = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const lines = content.split('\n');
         
@@ -7060,7 +7064,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
 
   async convertToCallout(args) {
     const { filename, text, callout_type = 'note' } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let content = await fs.readFile(filepath, 'utf-8');
@@ -7115,7 +7119,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
 
   async addTableOfContents(args) {
     const { filename, max_depth = 3 } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, 'utf-8');
@@ -7212,7 +7216,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
 
   async standardizeFormatting(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       let content = await fs.readFile(filepath, 'utf-8');
@@ -7263,7 +7267,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       const notes = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '');
         notes.push({ file, content: bodyContent.toLowerCase().trim() });
@@ -7315,7 +7319,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       const emptyNotes = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '').trim();
         
@@ -7350,7 +7354,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       const largeNotes = [];
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const stats = await fs.stat(filepath);
         const sizeKb = stats.size / 1024;
         
@@ -7390,7 +7394,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       let emptyNotes = 0;
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         
         // Word count
@@ -7458,7 +7462,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       let fixedCount = 0;
 
       for (const file of mdFiles) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         let content = await fs.readFile(filepath, 'utf-8');
         let modified = false;
         
@@ -7505,8 +7509,8 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
     const { file1, file2 } = args;
 
     try {
-      const path1 = path.join(OBSIDIAN_VAULT_PATH, file1);
-      const path2 = path.join(OBSIDIAN_VAULT_PATH, file2);
+      const path1 = safeVaultPath(OBSIDIAN_VAULT_PATH, file1);
+      const path2 = safeVaultPath(OBSIDIAN_VAULT_PATH, file2);
 
       const content1 = await fs.readFile(path1, 'utf-8');
       const content2 = await fs.readFile(path2, 'utf-8');
@@ -7554,7 +7558,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
 
   async findSimilarNotes(args) {
     const { filename, limit = 5 } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const targetContent = await fs.readFile(filepath, 'utf-8');
@@ -7565,7 +7569,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
       const similarities = [];
 
       for (const file of mdFiles) {
-        const otherPath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const otherPath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const otherContent = await fs.readFile(otherPath, 'utf-8');
         const otherWords = new Set(otherContent.toLowerCase().replace(/^---\n[\s\S]*?\n---\n/, '').split(/\s+/));
         
@@ -7598,7 +7602,7 @@ ${include_completed ? `\n## Completed Tasks\n\n${tasks.completed.map(t => `- [x]
 
   async trackNoteChanges(args) {
     const { filename } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const stats = await fs.stat(filepath);
@@ -7642,7 +7646,7 @@ Note: For full version history, use a git repository or Obsidian Sync.
       const allContent = [];
 
       for (const file of filenames) {
-        const filepath = path.join(OBSIDIAN_VAULT_PATH, file);
+        const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, file);
         const content = await fs.readFile(filepath, 'utf-8');
         const bodyContent = content.replace(/^---\n[\s\S]*?\n---\n/, '');
         allContent.push({ file, content: bodyContent });
@@ -7677,7 +7681,7 @@ tags: ["merged"]
 
 `;
 
-      const outputPath = path.join(OBSIDIAN_VAULT_PATH, output_filename.endsWith('.md') ? output_filename : `${output_filename}.md`);
+      const outputPath = safeVaultPath(OBSIDIAN_VAULT_PATH, output_filename.endsWith('.md') ? output_filename : `${output_filename}.md`);
       await fs.writeFile(outputPath, frontmatter + mergedContent, 'utf-8');
 
       return {
@@ -7699,7 +7703,7 @@ tags: ["merged"]
 
   async splitNoteByHeadings(args) {
     const { filename, heading_level = 2, output_folder } = args;
-    const filepath = path.join(OBSIDIAN_VAULT_PATH, filename);
+    const filepath = safeVaultPath(OBSIDIAN_VAULT_PATH, filename);
 
     try {
       const content = await fs.readFile(filepath, 'utf-8');
@@ -7726,7 +7730,7 @@ tags: ["merged"]
         sections.push(currentSection);
       }
 
-      const outputDir = output_folder ? path.join(OBSIDIAN_VAULT_PATH, output_folder) : path.join(OBSIDIAN_VAULT_PATH, filename.replace('.md', '-split'));
+      const outputDir = output_folder ? safeVaultPath(OBSIDIAN_VAULT_PATH, output_folder) : safeVaultPath(OBSIDIAN_VAULT_PATH, filename.replace('.md', '-split'));
       await fs.mkdir(outputDir, { recursive: true });
 
       for (const section of sections) {
